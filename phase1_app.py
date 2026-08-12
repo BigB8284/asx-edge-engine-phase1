@@ -1,16 +1,24 @@
 """
-HISTORICAL EDGE ENGINE — PHASE 1 BASELINE
-=============================================
-Deploy like your other tools. This is a heavier run than the validator —
-~60 tickers of full daily history plus 18 hypothesis evaluations — so it
-can take a few minutes on first run. Results are cached for 12 hours so
-you're not re-pulling everything every time you open the app.
+HISTORICAL EDGE ENGINE — PHASE 1 BASELINE (v1.1 — instrumentation only)
+===========================================================================
+Same V1 hypotheses, same config_v1.py, same thresholds — NOTHING about
+what counts as a match has changed. This version reports the SAME
+results at finer granularity:
+  - day_level: one observation per matched day (basket average) — the
+    correct basis for a genuine day-count win rate / CI, since pooling
+    every (stock, day) pair as independent evidence overstates
+    confidence when stocks in a basket move together.
+  - per_stock: each basket member's own result, to see whether an
+    apparent edge is broad or concentrated in one name.
+  - confirmation comparison: for the three genuinely nested pairs
+    (Energy, Gold, Iron Ore), isolates what the confirming driver
+    actually added using the ACTUAL matched dates, not a headline
+    percentage comparison across two different samples. Lithium's
+    H3b is NOT a nested confirmation of H3 (different threshold on
+    the same driver, not a strict superset condition) so it's
+    excluded from this comparison rather than faked.
 
-This produces the FROZEN V1 baseline: the first, untouched pass across
-train/validation/test for every hypothesis. Once you've reviewed it and
-we agree it's the baseline, don't re-run this to chase better numbers —
-any future change gets compared against the downloaded CSV from this
-run, in a v2 file, not by re-running this one differently.
+Deploy like before. This run takes about as long as the last one.
 """
 
 import streamlit as st
@@ -18,19 +26,22 @@ import pandas as pd
 
 from config_v1 import DRIVERS, ASX_THEME_STOCKS, HYPOTHESES, COSTS
 from historical_data import build_driver_table, align_to_asx_sessions, build_asx_outcome_tables, fetch_raw_history
-from backtest import evaluate_hypothesis
+from backtest import evaluate_hypothesis_detailed, compare_confirmed_vs_unconfirmed
 
 st.set_page_config(page_title="Phase 1 Baseline", layout="wide")
-st.title("Historical Edge Engine — Phase 1 Baseline")
-st.caption("First untouched pass across all 18 hypotheses. Frozen once reviewed — future changes compare against this, they don't overwrite it.")
+st.title("Historical Edge Engine — Phase 1 Baseline (detailed)")
+st.caption("Same V1 hypotheses and thresholds as before — this run adds day-level, per-stock, and confirmation-isolation detail on top of the same results.")
+
+CONFIRMATION_PAIRS = [
+    ("H1_long", "H1b_long"), ("H1_short", "H1b_short"),
+    ("H2_long", "H2b_long"), ("H2_short", "H2b_short"),
+    ("H4_long", "H4b_long"), ("H4_short", "H4b_short"),
+]
+OUTCOME_COLUMNS = ["open_to_close_pct", "next_session_return", "day2_return", "day3_return"]
 
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def cached_fetch(ticker):
-    """Caches EACH TICKER individually. If a batch pull partially fails
-    and the app is re-run, tickers that already succeeded are served
-    instantly from here — only the ones that actually failed get
-    re-attempted, instead of re-pulling all ~59 from scratch."""
     return fetch_raw_history(ticker)
 
 
@@ -52,105 +63,154 @@ def needed_asx_tickers():
     return tuple(sorted(tickers))
 
 
-def flatten_for_csv(results):
-    """One row per (hypothesis, outcome_column, split) — the archival
-    format for the frozen baseline CSV."""
+def flatten_day_and_stockday(results):
     rows = []
     for r in results:
-        if r.get("n_matched", 0) == 0:
+        if r.get("n_matched_days", 0) == 0:
             rows.append({"hypothesis_id": r["hypothesis_id"], "note": r.get("note", "")})
             continue
-        for col in ["open_to_close_pct", "next_session_return", "day2_return", "day3_return"]:
-            for split in ["train", "validation", "test"]:
-                stats = r[col][split]
+        for granularity in ["day_level", "stock_day"]:
+            for col in OUTCOME_COLUMNS:
+                for split in ["train", "validation", "test"]:
+                    stats = r[granularity][col][split]
+                    row = {
+                        "hypothesis_id": r["hypothesis_id"], "label": r["label"],
+                        "direction": r["direction"], "theme": r["theme"],
+                        "granularity": granularity, "outcome_column": col, "split": split,
+                        "n_matched_days": r["n_matched_days"], "n_train_days": r["n_train_days"],
+                        "n_validation_days": r["n_validation_days"], "n_test_days": r["n_test_days"],
+                    }
+                    row.update(stats)
+                    rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def flatten_per_stock(results):
+    rows = []
+    for r in results:
+        if r.get("n_matched_days", 0) == 0:
+            continue
+        for col in OUTCOME_COLUMNS:
+            for ticker, splits in r["per_stock"][col].items():
+                for split, stats in splits.items():
+                    row = {
+                        "hypothesis_id": r["hypothesis_id"], "direction": r["direction"],
+                        "theme": r["theme"], "ticker": ticker,
+                        "outcome_column": col, "split": split,
+                    }
+                    row.update(stats)
+                    rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def flatten_confirmation_comparisons(comparisons):
+    rows = []
+    for comp in comparisons:
+        if "error" in comp:
+            rows.append({"base_id": comp.get("base_id"), "error": comp["error"]})
+            continue
+        for group in ["confirmed", "unconfirmed_only"]:
+            for col in OUTCOME_COLUMNS:
+                stats = comp[group][col]
                 row = {
-                    "hypothesis_id": r["hypothesis_id"], "label": r["label"],
-                    "direction": r["direction"], "theme": r["theme"],
-                    "outcome_column": col, "split": split,
+                    "base_id": comp["base_id"], "confirmed_id": comp["confirmed_id"],
+                    "n_confirmed_days": comp["n_confirmed_days"], "n_unconfirmed_only_days": comp["n_unconfirmed_only_days"],
+                    "group": group, "outcome_column": col,
                 }
                 row.update(stats)
                 rows.append(row)
     return pd.DataFrame(rows)
 
 
-if st.button("Run Phase 1 baseline", type="primary", use_container_width=True):
+if st.button("Run Phase 1 baseline (detailed)", type="primary", use_container_width=True):
     with st.spinner("Pulling driver history (~37 tickers)..."):
         driver_table, driver_failures = load_driver_table()
     st.success(f"Driver table: {driver_table.shape[0]} rows x {driver_table.shape[1]} drivers")
     if driver_failures:
-        st.warning(
-            f"{len(driver_failures)} driver ticker(s) failed even after retries and were skipped "
-            f"(not faked, not substituted): {', '.join(f'{n} ({t})' for n, t in driver_failures)}. "
-            f"Any hypothesis using these will show a reduced or missing sample — re-running the app "
-            f"later will only retry these, not re-pull everything."
-        )
+        st.warning(f"{len(driver_failures)} driver ticker(s) failed and were skipped: "
+                   f"{', '.join(f'{n} ({t})' for n, t in driver_failures)}.")
 
     tickers_needed = needed_asx_tickers()
     with st.spinner(f"Pulling ASX outcome history ({len(tickers_needed)} tickers)..."):
         asx_outcomes, asx_failures = load_asx_outcomes(tickers_needed)
     st.success(f"ASX outcomes pulled for {len(asx_outcomes)} of {len(tickers_needed)} tickers")
     if asx_failures:
-        st.warning(
-            f"{len(asx_failures)} ASX ticker(s) failed even after retries and were skipped: "
-            f"{', '.join(asx_failures)}. Baskets containing these will run on the remaining stocks only."
-        )
+        st.warning(f"{len(asx_failures)} ASX ticker(s) failed and were skipped: {', '.join(asx_failures)}.")
 
     with st.spinner("Aligning overnight drivers to ASX sessions (no look-ahead)..."):
         all_asx_dates = sorted(set().union(*[df.index for df in asx_outcomes.values() if not df.empty]))
         aligned = align_to_asx_sessions(driver_table, all_asx_dates)
 
-    with st.spinner("Evaluating 18 hypotheses across train/validation/test..."):
+    with st.spinner("Evaluating 18 hypotheses at day-level, stock-day, and per-stock granularity..."):
         results = [
-            evaluate_hypothesis(h, aligned, asx_outcomes, ASX_THEME_STOCKS, COSTS)
+            evaluate_hypothesis_detailed(h, aligned, asx_outcomes, ASX_THEME_STOCKS, COSTS)
             for h in HYPOTHESES
         ]
 
+    with st.spinner("Isolating confirmation value on matched dates (Energy, Gold, Iron Ore)..."):
+        by_id = {h["id"]: h for h in HYPOTHESES}
+        comparisons = [
+            compare_confirmed_vs_unconfirmed(by_id[base_id], by_id[conf_id], aligned, asx_outcomes, ASX_THEME_STOCKS, COSTS)
+            for base_id, conf_id in CONFIRMATION_PAIRS
+        ]
+
     st.divider()
-    st.subheader("Summary — open→close outcome, by hypothesis")
+    st.subheader("Day-level summary — open→close, by hypothesis")
+    st.caption("day_count is the TRUE independent sample size. win_rate/expectancy here are basket-average-per-day, not pooled stock-days.")
     summary_rows = []
     for r in results:
-        if r.get("n_matched", 0) == 0:
-            summary_rows.append({"id": r["hypothesis_id"], "matched": 0, "note": r.get("note")})
+        if r.get("n_matched_days", 0) == 0:
+            summary_rows.append({"id": r["hypothesis_id"], "days": 0, "note": r.get("note")})
             continue
-        val_stats = r["open_to_close_pct"]["validation"]
-        test_stats = r["open_to_close_pct"]["test"]
+        val = r["day_level"]["open_to_close_pct"]["validation"]
+        test = r["day_level"]["open_to_close_pct"]["test"]
         summary_rows.append({
             "id": r["hypothesis_id"], "direction": r["direction"], "theme": r["theme"],
-            "n_matched": r["n_matched"], "n_train": r["n_train"], "n_val": r["n_validation"], "n_test": r["n_test"],
-            "val_band": val_stats.get("band"), "val_win_rate": val_stats.get("win_rate"),
-            "val_expectancy_net": val_stats.get("expectancy_net"),
-            "test_band": test_stats.get("band"), "test_win_rate": test_stats.get("win_rate"),
-            "test_expectancy_net": test_stats.get("expectancy_net"),
+            "n_train_days": r["n_train_days"], "n_val_days": r["n_validation_days"], "n_test_days": r["n_test_days"],
+            "val_band": val.get("band"), "val_win_rate": val.get("win_rate"), "val_expectancy_net": val.get("expectancy_net"),
+            "test_band": test.get("band"), "test_win_rate": test.get("win_rate"), "test_expectancy_net": test.get("expectancy_net"),
         })
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-    st.caption("val_/test_ expectancy_net is already after 5bps round-trip commission. band reflects sample-size confidence, not a claim of a confirmed edge.")
 
     st.divider()
-    st.subheader("Full detail per hypothesis")
-    for r in results:
-        label = r.get("label", r["hypothesis_id"])
-        with st.expander(f"{r['hypothesis_id']} — {label} (matched: {r.get('n_matched', 0)})"):
-            if r.get("n_matched", 0) == 0:
-                st.write(r.get("note", "No matches"))
-                continue
-            for col in ["open_to_close_pct", "next_session_return", "day2_return", "day3_return"]:
+    st.subheader("Confirmation isolation — does the confirming driver add anything, on matched dates")
+    for comp in comparisons:
+        if "error" in comp:
+            st.write(f"{comp.get('base_id')}: {comp['error']}")
+            continue
+        with st.expander(f"{comp['base_id']} vs {comp['confirmed_id']} — confirmed: {comp['n_confirmed_days']} days, unconfirmed-only: {comp['n_unconfirmed_only_days']} days"):
+            for col in OUTCOME_COLUMNS:
                 st.markdown(f"**{col}**")
-                split_df = pd.DataFrame(r[col]).T
-                st.dataframe(split_df, use_container_width=True)
-            if r.get("gap_breakdown_validation"):
-                st.markdown("**Opening-gap breakdown (validation set)**")
-                gap_df = pd.DataFrame(r["gap_breakdown_validation"]).T
-                st.dataframe(gap_df, use_container_width=True)
+                df = pd.DataFrame({"confirmed": comp["confirmed"][col], "unconfirmed_only": comp["unconfirmed_only"][col]}).T
+                st.dataframe(df, use_container_width=True)
 
     st.divider()
-    csv_df = flatten_for_csv(results)
-    st.download_button(
-        "Download frozen V1 baseline results (CSV)",
-        data=csv_df.to_csv(index=False),
-        file_name="baseline_v1_results.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-    st.caption("This CSV is the frozen baseline. Save it alongside config_v1.py. Every future change gets compared against this file, not re-generated by re-running this app differently.")
+    st.subheader("Per-stock breakdown")
+    for r in results:
+        if r.get("n_matched_days", 0) == 0:
+            continue
+        with st.expander(f"{r['hypothesis_id']} — per-stock ({', '.join(r['tickers'])})"):
+            for col in OUTCOME_COLUMNS:
+                st.markdown(f"**{col}** — validation win_rate / expectancy_net by stock")
+                rows = []
+                for ticker, splits in r["per_stock"][col].items():
+                    val = splits["validation"]
+                    rows.append({"ticker": ticker, "n": val.get("n"), "band": val.get("band"),
+                                 "win_rate": val.get("win_rate"), "expectancy_net": val.get("expectancy_net")})
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Downloads")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.download_button("Day-level + stock-day CSV", data=flatten_day_and_stockday(results).to_csv(index=False),
+                            file_name="baseline_v1_daylevel_and_stockday.csv", mime="text/csv", use_container_width=True)
+    with col2:
+        st.download_button("Per-stock CSV", data=flatten_per_stock(results).to_csv(index=False),
+                            file_name="baseline_v1_per_stock.csv", mime="text/csv", use_container_width=True)
+    with col3:
+        st.download_button("Confirmation comparison CSV", data=flatten_confirmation_comparisons(comparisons).to_csv(index=False),
+                            file_name="baseline_v1_confirmation_comparison.csv", mime="text/csv", use_container_width=True)
+    st.caption("These three files plus the original baseline_v1_results.csv together are the complete frozen V1 baseline.")
 else:
-    st.info("Tap 'Run Phase 1 baseline' to pull data and evaluate all 18 hypotheses. First run takes a few minutes.")
+    st.info("Tap to run. Same hypotheses as before, richer output — takes a similar amount of time to the last run.")
