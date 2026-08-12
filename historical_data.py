@@ -22,7 +22,9 @@ from config_v1 import DRIVERS, PER_OBSERVATION_GAP_NULL_THRESHOLD_DAYS
 
 def fetch_raw_history(ticker, max_retries=3):
     """Pulls full daily history for a ticker, with retry/backoff on
-    rate-limit errors (never treat a Yahoo throttle as 'no data')."""
+    rate-limit errors. Returns None (never raises) if the ticker still
+    fails after retries — the caller decides whether to skip it. One
+    bad ticker must never take down an entire batch pull."""
     for attempt in range(max_retries):
         try:
             hist = yf.Ticker(ticker).history(period="max")
@@ -31,8 +33,8 @@ def fetch_raw_history(ticker, max_retries=3):
             if "Too Many Requests" in str(e) or "rate limit" in str(e).lower():
                 time.sleep(3 * (attempt + 1))
                 continue
-            raise
-    raise RuntimeError(f"{ticker}: exhausted retries on rate limiting")
+            return None  # a real (non-rate-limit) error - no point retrying
+    return None  # exhausted retries
 
 
 def compute_valid_pct_change(hist, gap_threshold_days=PER_OBSERVATION_GAP_NULL_THRESHOLD_DAYS):
@@ -50,21 +52,32 @@ def compute_valid_pct_change(hist, gap_threshold_days=PER_OBSERVATION_GAP_NULL_T
     return pd.Series(pct_change, index=dates, name="pct_change")
 
 
-def build_driver_table(driver_names=None):
+def build_driver_table(driver_names=None, fetch_fn=None):
     """Wide table: index = driver's own trading date, one column per
     named driver, values = % change (NaN where nulled or missing).
-    NOT yet aligned to ASX sessions — see align_to_asx_sessions."""
+    NOT yet aligned to ASX sessions — see align_to_asx_sessions.
+
+    Returns (table, failed) — failed is a list of (name, ticker) pairs
+    that never returned data even after retries. Never silently drops
+    them without telling you.
+    """
+    fetch_fn = fetch_fn or fetch_raw_history
     driver_names = driver_names or list(DRIVERS.keys())
     series_list = []
+    failed = []
     for name in driver_names:
         ticker, role, first_available, notes = DRIVERS[name]
-        hist = fetch_raw_history(ticker)
+        hist = fetch_fn(ticker)
+        time.sleep(0.5)  # pacing between requests, reduces chance of triggering throttling at all
+        if hist is None or hist.empty:
+            failed.append((name, ticker))
+            continue
         s = compute_valid_pct_change(hist)
         s.name = name
         series_list.append(s)
-    table = pd.concat(series_list, axis=1)
+    table = pd.concat(series_list, axis=1) if series_list else pd.DataFrame()
     table.index.name = "date"
-    return table.sort_index()
+    return table.sort_index(), failed
 
 
 def align_to_asx_sessions(driver_table, asx_dates):
@@ -94,11 +107,14 @@ def align_to_asx_sessions(driver_table, asx_dates):
     return merged
 
 
-def compute_asx_outcomes(ticker, gap_threshold_days=PER_OBSERVATION_GAP_NULL_THRESHOLD_DAYS):
+def compute_asx_outcomes(ticker, gap_threshold_days=PER_OBSERVATION_GAP_NULL_THRESHOLD_DAYS, fetch_fn=None):
     """Per-ASX-ticker outcome table. Columns match the Step 2 spec.
-    10:15/10:30-dependent columns are present but NaN until Phase 2."""
-    hist = fetch_raw_history(ticker)
-    if hist.empty:
+    10:15/10:30-dependent columns are present but NaN until Phase 2.
+    Returns an empty DataFrame (never raises) if the ticker's fetch
+    failed — the caller checks .empty and reports it."""
+    fetch_fn = fetch_fn or fetch_raw_history
+    hist = fetch_fn(ticker)
+    if hist is None or hist.empty:
         return pd.DataFrame()
     hist = hist.dropna(subset=["Open", "High", "Low", "Close"]).copy()
     dates = pd.to_datetime(hist.index.date)
@@ -151,6 +167,18 @@ def compute_asx_outcomes(ticker, gap_threshold_days=PER_OBSERVATION_GAP_NULL_THR
     return out
 
 
-def build_asx_outcome_tables(tickers):
-    """Dict of ticker -> outcome DataFrame, for a list of ASX tickers."""
-    return {t: compute_asx_outcomes(t) for t in tickers}
+def build_asx_outcome_tables(tickers, fetch_fn=None):
+    """Dict of ticker -> outcome DataFrame, for a list of ASX tickers.
+    Returns (tables, failed) — failed is a list of tickers that never
+    returned data even after retries."""
+    fetch_fn = fetch_fn or fetch_raw_history
+    result = {}
+    failed = []
+    for t in tickers:
+        df = compute_asx_outcomes(t, fetch_fn=fetch_fn)
+        time.sleep(0.5)  # pacing between requests
+        if df.empty:
+            failed.append(t)
+        else:
+            result[t] = df
+    return result, failed
