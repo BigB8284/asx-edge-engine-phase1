@@ -1,349 +1,198 @@
 """
-BACKTEST ENGINE
-==================
-Pure statistics on top of the tables historical_data.py builds. No
-invented scores anywhere here — every number is computed from real
-matched historical sessions, or the function returns "insufficient
-sample" rather than a number.
+V2 DIAGNOSTICS — Tests 2 & 3
+================================
+Does NOT modify V1. Imports config_v1.py's frozen HYPOTHESES as-is and
+reuses the same driver/outcome data pipeline. This is a separate,
+additional analysis layer on top of the frozen baseline, not a new
+version of it.
+
+Test 2: confirmed-vs-unconfirmed comparison, split chronologically AND
+per-ticker — is BHP ADR confirmation a validated feature or a pattern
+that only existed in the data already looked at.
+
+Test 3: opening-gap relationship — pre-specified buckets (reused from
+config_v1.GAP_BUCKETS, nothing new) plus a Spearman monotonic
+correlation between gap size and same-day return, as a diagnostic only.
+Diagnostic set = train+validation pooled. Test set analysed separately,
+touched once, never used to pick a threshold.
+
+Scoped to the two hypothesis clusters that survived V1 (Energy H1/H1b,
+Iron Ore H4/H4b), both directions — not all 18, per the V2 brief of
+translating SURVIVING findings into tradeable setups.
 """
 
-import math
-import numpy as np
+import streamlit as st
 import pandas as pd
 
-from config_v1 import (
-    GAP_BUCKETS, COSTS, SAMPLE_SIZE_BANDS, SPLIT_RATIOS,
-)
+from config_v1 import DRIVERS, ASX_THEME_STOCKS, HYPOTHESES, COSTS
+from historical_data import build_driver_table, align_to_asx_sessions, build_asx_outcome_tables, fetch_raw_history
+from backtest import compare_confirmed_vs_unconfirmed_by_split, gap_relationship_analysis
+
+st.set_page_config(page_title="V2 Diagnostics", layout="wide")
+st.title("V2 Diagnostics — Tests 2 & 3")
+st.caption("Does not modify config_v1.py or any V1 threshold. Reuses the frozen hypotheses as-is.")
+
+CONFIRMATION_PAIRS = [("H4_long", "H4b_long"), ("H4_short", "H4b_short")]
+GAP_TEST_HYPOTHESES = ["H1_long", "H1_short", "H1b_long", "H1b_short",
+                        "H4_long", "H4_short", "H4b_long", "H4b_short"]
+OUTCOME_COLUMNS = ["open_to_close_pct", "next_session_return", "day2_return", "day3_return"]
 
 
-def sample_band(n):
-    for lo, hi, label, note in SAMPLE_SIZE_BANDS:
-        if lo <= n < hi:
-            return label, note
-    return "insufficient", "Not shown as an edge — informational only"
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def cached_fetch(ticker):
+    return fetch_raw_history(ticker)
 
 
-def wilson_ci(win_rate, n, z=1.96):
-    """Wilson score interval on a win rate — honest uncertainty rather
-    than a bare point estimate, especially important at small N."""
-    if n == 0:
-        return (float("nan"), float("nan"))
-    denom = 1 + z**2 / n
-    centre = win_rate + z**2 / (2 * n)
-    adj = z * math.sqrt((win_rate * (1 - win_rate) + z**2 / (4 * n)) / n)
-    lo = (centre - adj) / denom
-    hi = (centre + adj) / denom
-    return (max(0.0, lo), min(1.0, hi))
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def load_driver_table():
+    return build_driver_table(list(DRIVERS.keys()), fetch_fn=cached_fetch)
 
 
-def apply_costs(returns, costs=None):
-    """Subtracts round-trip commission + slippage (in bps) from each
-    return. Slippage defaults to 0 and is reported as unset, not
-    modelled — never silently baked into a number as if it were real."""
-    costs = costs or COSTS
-    total_bps = costs["commission_bps_roundtrip"] + costs["slippage_bps_roundtrip"]
-    return returns - (total_bps / 100.0)
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def load_asx_outcomes(tickers_tuple):
+    return build_asx_outcome_tables(list(tickers_tuple), fetch_fn=cached_fetch)
 
 
-def compute_stats(returns, costs=None):
-    """Full stats bundle for a series of % returns. Returns None (with
-    a reason) if the sample is empty."""
-    returns = pd.Series(returns).dropna()
-    n = len(returns)
-    if n == 0:
-        return {"n": 0, "band": "insufficient", "note": "No matching historical sessions"}
-
-    winners = returns[returns > 0]
-    losers = returns[returns < 0]
-
-    win_rate = len(winners) / n
-    ci_lo, ci_hi = wilson_ci(win_rate, n)
-
-    mean_ret = returns.mean()
-    median_ret = returns.median()
-    avg_winner = winners.mean() if len(winners) else float("nan")
-    median_winner = winners.median() if len(winners) else float("nan")
-    avg_loser = losers.mean() if len(losers) else float("nan")
-    median_loser = losers.median() if len(losers) else float("nan")
-
-    payoff_ratio = (avg_winner / abs(avg_loser)) if (len(winners) and len(losers) and avg_loser != 0) else float("nan")
-    gross_win = winners.sum()
-    gross_loss = abs(losers.sum())
-    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else float("nan")
-
-    expectancy = win_rate * (avg_winner if len(winners) else 0) + (1 - win_rate) * (avg_loser if len(losers) else 0)
-    stdev = returns.std()
-
-    band, band_note = sample_band(n)
-
-    net_returns = apply_costs(returns, costs)
-    net_expectancy = net_returns.mean()
-
-    return {
-        "n": n,
-        "band": band,
-        "band_note": band_note,
-        "win_rate": round(win_rate * 100, 1),
-        "win_rate_ci": (round(ci_lo * 100, 1), round(ci_hi * 100, 1)),
-        "mean_return": round(mean_ret, 3),
-        "median_return": round(median_ret, 3),
-        "avg_winner": round(avg_winner, 3) if not math.isnan(avg_winner) else None,
-        "median_winner": round(median_winner, 3) if not math.isnan(median_winner) else None,
-        "avg_loser": round(avg_loser, 3) if not math.isnan(avg_loser) else None,
-        "median_loser": round(median_loser, 3) if not math.isnan(median_loser) else None,
-        "payoff_ratio": round(payoff_ratio, 2) if not math.isnan(payoff_ratio) else None,
-        "profit_factor": round(profit_factor, 2) if not math.isnan(profit_factor) else None,
-        "expectancy_gross": round(expectancy, 3),
-        "expectancy_net": round(net_expectancy, 3),
-        "stdev": round(stdev, 3),
-    }
+def needed_tickers():
+    themes = {"Energy (Oil/Gas)", "Iron Ore"}
+    tickers = set()
+    for t in themes:
+        tickers.update(ASX_THEME_STOCKS[t])
+    return tuple(sorted(tickers))
 
 
-def gap_bucket_for(gap_pct, direction):
-    """Direction-adjusted gap bucket: a SHORT setup's 'favourable' gap
-    is a negative one, so we bucket the gap in the direction of the
-    trade, not its raw sign."""
-    if gap_pct is None or (isinstance(gap_pct, float) and math.isnan(gap_pct)):
-        return None
-    signed = gap_pct if direction == "LONG" else -gap_pct
-    for label, lo, hi in GAP_BUCKETS:
-        if lo <= signed < hi:
-            return label
-    return None
-
-
-def chronological_split(dates, ratios=None):
-    """Splits a sorted sequence of dates into train/validation/test by
-    POSITION, not randomly — critical for time series, prevents future
-    information leaking into training."""
-    ratios = ratios or SPLIT_RATIOS
-    dates = sorted(dates)
-    n = len(dates)
-    n_train = int(n * ratios["train"])
-    n_val = int(n * ratios["validation"])
-    train = dates[:n_train]
-    val = dates[n_train:n_train + n_val]
-    test = dates[n_train + n_val:]
-    return train, val, test
-
-
-def _collect_stock_day_returns(dates, tickers, asx_outcomes_by_ticker, col, sign):
-    """Every (date, stock) pair as its own observation — the existing
-    pooled granularity."""
+def flatten_confirmation_by_split(results):
     rows = []
-    for d in dates:
-        for t in tickers:
-            df = asx_outcomes_by_ticker.get(t)
-            if df is None or d not in df.index:
-                continue
-            val = df.loc[d, col]
-            if pd.isna(val):
-                continue
-            rows.append(val * sign)
-    return rows
-
-
-def _collect_day_level_returns(dates, tickers, asx_outcomes_by_ticker, col, sign):
-    """One observation PER DAY: the basket's average return across
-    whichever stocks had valid data that day. This is the correct
-    input for a genuine day-count win rate/CI, since stock-day pooling
-    treats correlated same-day moves across a basket as independent
-    evidence, which overstates confidence."""
-    rows = []
-    for d in dates:
-        day_vals = []
-        for t in tickers:
-            df = asx_outcomes_by_ticker.get(t)
-            if df is None or d not in df.index:
-                continue
-            val = df.loc[d, col]
-            if pd.isna(val):
-                continue
-            day_vals.append(val * sign)
-        if day_vals:
-            rows.append(sum(day_vals) / len(day_vals))
-    return rows
-
-
-def _collect_per_stock_returns(dates, ticker, asx_outcomes_by_ticker, col, sign):
-    """Returns for ONE stock only, across the matched dates — reveals
-    whether a basket-level result is broad or concentrated in one name."""
-    df = asx_outcomes_by_ticker.get(ticker)
-    if df is None:
-        return []
-    rows = []
-    for d in dates:
-        if d not in df.index:
+    for r in results:
+        if "error" in r:
+            rows.append({"base_id": r.get("base_id"), "error": r["error"]})
             continue
-        val = df.loc[d, col]
-        if pd.isna(val):
+        for group in ["confirmed", "unconfirmed_only"]:
+            g = r[group]
+            for col in OUTCOME_COLUMNS:
+                for split in ["train", "validation", "test"]:
+                    stats = g["day_level"][col][split]
+                    row = {"base_id": r["base_id"], "confirmed_id": r["confirmed_id"], "group": group,
+                           "granularity": "day_level", "outcome_column": col, "split": split}
+                    row.update(stats)
+                    rows.append(row)
+                for ticker, splits in g["per_stock"][col].items():
+                    for split, stats in splits.items():
+                        row = {"base_id": r["base_id"], "confirmed_id": r["confirmed_id"], "group": group,
+                               "granularity": "per_stock", "ticker": ticker,
+                               "outcome_column": col, "split": split}
+                        row.update(stats)
+                        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def flatten_gap_analysis(results):
+    rows = []
+    for r in results:
+        if r.get("n_matched_days", 0) == 0:
             continue
-        rows.append(val * sign)
-    return rows
+        for period_key in ["diagnostic_train_validation", "held_out_test"]:
+            period = r[period_key]
+            rows.append({
+                "hypothesis_id": r["hypothesis_id"], "period": period["label"], "n_days": period["n_days"],
+                "bucket": "ALL (correlation)", "granularity": "day_level", "ticker": "",
+                "spearman_corr": period["spearman_gap_vs_return_day_level"],
+            })
+            for ticker, corr in period["spearman_gap_vs_return_per_ticker"].items():
+                rows.append({
+                    "hypothesis_id": r["hypothesis_id"], "period": period["label"], "n_days": period["n_days"],
+                    "bucket": "ALL (correlation)", "granularity": "per_stock", "ticker": ticker,
+                    "spearman_corr": corr,
+                })
+            for bucket, stats in period["gap_buckets_day_level"].items():
+                row = {"hypothesis_id": r["hypothesis_id"], "period": period["label"], "n_days": period["n_days"],
+                       "bucket": bucket, "granularity": "day_level", "ticker": ""}
+                row.update(stats)
+                rows.append(row)
+            for ticker, buckets in period["gap_buckets_per_ticker"].items():
+                for bucket, stats in buckets.items():
+                    row = {"hypothesis_id": r["hypothesis_id"], "period": period["label"], "n_days": period["n_days"],
+                           "bucket": bucket, "granularity": "per_stock", "ticker": ticker}
+                    row.update(stats)
+                    rows.append(row)
+    return pd.DataFrame(rows)
 
 
-def evaluate_hypothesis_detailed(hypothesis, aligned_driver_table, asx_outcomes_by_ticker,
-                                  asx_theme_stocks, costs=None):
-    """Same matched-date logic and same chronological split as
-    evaluate_hypothesis — this does not change what counts as a match,
-    it reports the SAME result at three granularities:
-      - stock_day: pooled (date, stock) pairs, as before
-      - day_level: one observation per day (basket average), the
-        correct basis for a day-count win rate/CI
-      - per_stock: each basket member's own stats, to check breadth
-    """
-    theme = hypothesis["theme"]
-    direction = hypothesis["direction"]
-    usable_from = pd.Timestamp(hypothesis["usable_from"])
-    tickers = asx_theme_stocks[theme]
+if st.button("Run V2 diagnostics (Tests 2 & 3)", type="primary", use_container_width=True):
+    with st.spinner("Pulling driver history..."):
+        driver_table, driver_failures = load_driver_table()
+    if driver_failures:
+        st.warning(f"{len(driver_failures)} driver ticker(s) failed: {', '.join(f'{n} ({t})' for n, t in driver_failures)}")
 
-    driver_slice = aligned_driver_table[aligned_driver_table.index >= usable_from]
-    matched_dates = [d for d in driver_slice.index if hypothesis["condition"](driver_slice.loc[d])]
+    tickers_needed = needed_tickers()
+    with st.spinner(f"Pulling ASX outcome history ({len(tickers_needed)} tickers)..."):
+        asx_outcomes, asx_failures = load_asx_outcomes(tickers_needed)
+    if asx_failures:
+        st.warning(f"{len(asx_failures)} ASX ticker(s) failed: {', '.join(asx_failures)}")
 
-    if not matched_dates:
-        return {"hypothesis_id": hypothesis["id"], "n_matched_days": 0, "note": "No historical matches found"}
+    with st.spinner("Aligning overnight drivers to ASX sessions..."):
+        all_asx_dates = sorted(set().union(*[df.index for df in asx_outcomes.values() if not df.empty]))
+        aligned = align_to_asx_sessions(driver_table, all_asx_dates)
 
-    train_dates, val_dates, test_dates = chronological_split(matched_dates)
-    outcome_columns = ["open_to_close_pct", "next_session_return", "day2_return", "day3_return"]
-    sign = 1 if direction == "LONG" else -1
+    by_id = {h["id"]: h for h in HYPOTHESES}
 
-    result = {"hypothesis_id": hypothesis["id"], "label": hypothesis["label"],
-              "direction": direction, "theme": theme, "tickers": tickers,
-              "n_matched_days": len(matched_dates),
-              "n_train_days": len(train_dates), "n_validation_days": len(val_dates), "n_test_days": len(test_dates)}
+    with st.spinner("Test 2: confirmation value, split chronologically and per ticker..."):
+        confirm_results = [
+            compare_confirmed_vs_unconfirmed_by_split(by_id[b], by_id[c], aligned, asx_outcomes, ASX_THEME_STOCKS, COSTS)
+            for b, c in CONFIRMATION_PAIRS
+        ]
 
-    splits = [("train", train_dates), ("validation", val_dates), ("test", test_dates)]
+    with st.spinner("Test 3: opening-gap relationship (buckets + monotonic correlation)..."):
+        gap_results = [
+            gap_relationship_analysis(by_id[hid], aligned, asx_outcomes, ASX_THEME_STOCKS, COSTS)
+            for hid in GAP_TEST_HYPOTHESES
+        ]
 
-    for col in outcome_columns:
-        result.setdefault("stock_day", {})[col] = {
-            split_name: compute_stats(_collect_stock_day_returns(split_dates, tickers, asx_outcomes_by_ticker, col, sign), costs)
-            for split_name, split_dates in splits
-        }
-        result.setdefault("day_level", {})[col] = {
-            split_name: compute_stats(_collect_day_level_returns(split_dates, tickers, asx_outcomes_by_ticker, col, sign), costs)
-            for split_name, split_dates in splits
-        }
-        per_stock = {}
-        for t in tickers:
-            per_stock[t] = {
-                split_name: compute_stats(_collect_per_stock_returns(split_dates, t, asx_outcomes_by_ticker, col, sign), costs)
-                for split_name, split_dates in splits
-            }
-        result.setdefault("per_stock", {})[col] = per_stock
+    st.divider()
+    st.subheader("Test 2 — Confirmation value, out-of-sample")
+    for r in confirm_results:
+        if "error" in r:
+            st.write(f"{r.get('base_id')}: {r['error']}")
+            continue
+        with st.expander(f"{r['base_id']} vs {r['confirmed_id']}"):
+            for group in ["confirmed", "unconfirmed_only"]:
+                g = r[group]
+                st.markdown(f"**{group}** — {g['n_total_days']} days total "
+                            f"(train {g['n_train_days']} / val {g['n_validation_days']} / test {g['n_test_days']})")
+                df = pd.DataFrame(g["day_level"]["open_to_close_pct"]).T
+                st.dataframe(df, use_container_width=True)
+                rows = []
+                for ticker, splits in g["per_stock"]["open_to_close_pct"].items():
+                    for split, stats in splits.items():
+                        rows.append({"ticker": ticker, "split": split, "n": stats.get("n"),
+                                     "expectancy_net": stats.get("expectancy_net")})
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    return result
+    st.divider()
+    st.subheader("Test 3 — Opening-gap relationship")
+    for r in gap_results:
+        if r.get("n_matched_days", 0) == 0:
+            continue
+        with st.expander(f"{r['hypothesis_id']} — {r['label']}"):
+            for period_key, period_label in [("diagnostic_train_validation", "Train+Validation (diagnostic)"),
+                                              ("held_out_test", "Test (checked once)")]:
+                period = r[period_key]
+                st.markdown(f"**{period_label}** — {period['n_days']} days")
+                st.write(f"Spearman correlation (gap vs return, basket day-level): "
+                         f"{period['spearman_gap_vs_return_day_level']}")
+                bucket_df = pd.DataFrame(period["gap_buckets_day_level"]).T
+                st.dataframe(bucket_df, use_container_width=True)
 
-
-def compare_confirmed_vs_unconfirmed(base_hypothesis, confirmed_hypothesis, aligned_driver_table,
-                                      asx_outcomes_by_ticker, asx_theme_stocks, costs=None):
-    """Isolates what a confirmation driver actually added, using MATCHED
-    DATES rather than comparing headline percentages from two different
-    samples. base_hypothesis's condition must be implied by
-    confirmed_hypothesis's condition (e.g. H4 <- H4b) so that
-    confirmed's matched dates are a subset of base's.
-
-    Returns stats for:
-      - 'confirmed': days where BOTH conditions held (already reported
-        elsewhere, included here for direct side-by-side comparison)
-      - 'unconfirmed_only': days where the base condition held but the
-        extra confirming condition did NOT — the true counterfactual
-        for "did the confirmation add anything"
-    """
-    theme = base_hypothesis["theme"]
-    direction = base_hypothesis["direction"]
-    usable_from = pd.Timestamp(base_hypothesis["usable_from"])
-    tickers = asx_theme_stocks[theme]
-    sign = 1 if direction == "LONG" else -1
-
-    driver_slice = aligned_driver_table[aligned_driver_table.index >= usable_from]
-    base_dates = set(d for d in driver_slice.index if base_hypothesis["condition"](driver_slice.loc[d]))
-    confirmed_dates = set(d for d in driver_slice.index if confirmed_hypothesis["condition"](driver_slice.loc[d]))
-
-    if not confirmed_dates.issubset(base_dates):
-        return {"error": "confirmed_hypothesis condition is not a subset of base_hypothesis condition — "
-                          "not a valid confirmed-vs-unconfirmed comparison for this pair"}
-
-    unconfirmed_only_dates = sorted(base_dates - confirmed_dates)
-    confirmed_dates = sorted(confirmed_dates)
-
-    outcome_columns = ["open_to_close_pct", "next_session_return", "day2_return", "day3_return"]
-    result = {
-        "base_id": base_hypothesis["id"], "confirmed_id": confirmed_hypothesis["id"],
-        "n_confirmed_days": len(confirmed_dates), "n_unconfirmed_only_days": len(unconfirmed_only_dates),
-    }
-    for col in outcome_columns:
-        result.setdefault("confirmed", {})[col] = compute_stats(
-            _collect_day_level_returns(confirmed_dates, tickers, asx_outcomes_by_ticker, col, sign), costs)
-        result.setdefault("unconfirmed_only", {})[col] = compute_stats(
-            _collect_day_level_returns(unconfirmed_only_dates, tickers, asx_outcomes_by_ticker, col, sign), costs)
-    return result
-
-
-def evaluate_hypothesis(hypothesis, aligned_driver_table, asx_outcomes_by_ticker,
-                         asx_theme_stocks, costs=None):
-    """Evaluates one hypothesis across its ASX basket, split
-    chronologically into train/validation/test, computed separately —
-    never optimised against test, test is touched exactly once here.
-
-    Returns a dict keyed by outcome column (open_to_close, next_session,
-    day2, day3), each containing train/validation/test stats plus a
-    gap-bucket breakdown computed on validation only (test stays
-    untouched until final reporting).
-    """
-    theme = hypothesis["theme"]
-    direction = hypothesis["direction"]
-    usable_from = pd.Timestamp(hypothesis["usable_from"])
-    tickers = asx_theme_stocks[theme]
-
-    driver_slice = aligned_driver_table[aligned_driver_table.index >= usable_from]
-    matched_dates = [d for d in driver_slice.index if hypothesis["condition"](driver_slice.loc[d])]
-
-    if not matched_dates:
-        return {"hypothesis_id": hypothesis["id"], "n_matched": 0, "note": "No historical matches found"}
-
-    train_dates, val_dates, test_dates = chronological_split(matched_dates)
-
-    outcome_columns = ["open_to_close_pct", "next_session_return", "day2_return", "day3_return"]
-    result = {"hypothesis_id": hypothesis["id"], "label": hypothesis["label"],
-              "direction": direction, "theme": theme, "n_matched": len(matched_dates),
-              "n_train": len(train_dates), "n_validation": len(val_dates), "n_test": len(test_dates)}
-
-    sign = 1 if direction == "LONG" else -1
-
-    for col in outcome_columns:
-        split_results = {}
-        for split_name, split_dates in [("train", train_dates), ("validation", val_dates), ("test", test_dates)]:
-            rows = []
-            for d in split_dates:
-                for t in tickers:
-                    df = asx_outcomes_by_ticker.get(t)
-                    if df is None or d not in df.index:
-                        continue
-                    val = df.loc[d, col]
-                    if pd.isna(val):
-                        continue
-                    rows.append(val * sign)
-            split_results[split_name] = compute_stats(rows, costs)
-        result[col] = split_results
-
-    # Gap-bucket breakdown, validation set only (test stays untouched)
-    gap_breakdown = {}
-    for d in val_dates:
-        for t in tickers:
-            df = asx_outcomes_by_ticker.get(t)
-            if df is None or d not in df.index:
-                continue
-            gap = df.loc[d, "gap_pct"]
-            ret = df.loc[d, "open_to_close_pct"]
-            if pd.isna(gap) or pd.isna(ret):
-                continue
-            bucket = gap_bucket_for(gap, direction)
-            if bucket is None:
-                continue
-            gap_breakdown.setdefault(bucket, []).append(ret * sign)
-
-    result["gap_breakdown_validation"] = {
-        bucket: compute_stats(rets, costs) for bucket, rets in gap_breakdown.items()
-    }
-
-    return result
+    st.divider()
+    st.subheader("Downloads")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button("Test 2 — Confirmation by split & ticker CSV",
+                            data=flatten_confirmation_by_split(confirm_results).to_csv(index=False),
+                            file_name="v2_test2_confirmation_by_split.csv", mime="text/csv", use_container_width=True)
+    with col2:
+        st.download_button("Test 3 — Gap relationship CSV",
+                            data=flatten_gap_analysis(gap_results).to_csv(index=False),
+                            file_name="v2_test3_gap_relationship.csv", mime="text/csv", use_container_width=True)
+else:
+    st.info("Tap to run Tests 2 & 3. Uses the same cached driver/ASX data as the Phase 1 app if run within 12 hours.")
