@@ -127,6 +127,158 @@ def chronological_split(dates, ratios=None):
     return train, val, test
 
 
+def _collect_stock_day_returns(dates, tickers, asx_outcomes_by_ticker, col, sign):
+    """Every (date, stock) pair as its own observation — the existing
+    pooled granularity."""
+    rows = []
+    for d in dates:
+        for t in tickers:
+            df = asx_outcomes_by_ticker.get(t)
+            if df is None or d not in df.index:
+                continue
+            val = df.loc[d, col]
+            if pd.isna(val):
+                continue
+            rows.append(val * sign)
+    return rows
+
+
+def _collect_day_level_returns(dates, tickers, asx_outcomes_by_ticker, col, sign):
+    """One observation PER DAY: the basket's average return across
+    whichever stocks had valid data that day. This is the correct
+    input for a genuine day-count win rate/CI, since stock-day pooling
+    treats correlated same-day moves across a basket as independent
+    evidence, which overstates confidence."""
+    rows = []
+    for d in dates:
+        day_vals = []
+        for t in tickers:
+            df = asx_outcomes_by_ticker.get(t)
+            if df is None or d not in df.index:
+                continue
+            val = df.loc[d, col]
+            if pd.isna(val):
+                continue
+            day_vals.append(val * sign)
+        if day_vals:
+            rows.append(sum(day_vals) / len(day_vals))
+    return rows
+
+
+def _collect_per_stock_returns(dates, ticker, asx_outcomes_by_ticker, col, sign):
+    """Returns for ONE stock only, across the matched dates — reveals
+    whether a basket-level result is broad or concentrated in one name."""
+    df = asx_outcomes_by_ticker.get(ticker)
+    if df is None:
+        return []
+    rows = []
+    for d in dates:
+        if d not in df.index:
+            continue
+        val = df.loc[d, col]
+        if pd.isna(val):
+            continue
+        rows.append(val * sign)
+    return rows
+
+
+def evaluate_hypothesis_detailed(hypothesis, aligned_driver_table, asx_outcomes_by_ticker,
+                                  asx_theme_stocks, costs=None):
+    """Same matched-date logic and same chronological split as
+    evaluate_hypothesis — this does not change what counts as a match,
+    it reports the SAME result at three granularities:
+      - stock_day: pooled (date, stock) pairs, as before
+      - day_level: one observation per day (basket average), the
+        correct basis for a day-count win rate/CI
+      - per_stock: each basket member's own stats, to check breadth
+    """
+    theme = hypothesis["theme"]
+    direction = hypothesis["direction"]
+    usable_from = pd.Timestamp(hypothesis["usable_from"])
+    tickers = asx_theme_stocks[theme]
+
+    driver_slice = aligned_driver_table[aligned_driver_table.index >= usable_from]
+    matched_dates = [d for d in driver_slice.index if hypothesis["condition"](driver_slice.loc[d])]
+
+    if not matched_dates:
+        return {"hypothesis_id": hypothesis["id"], "n_matched_days": 0, "note": "No historical matches found"}
+
+    train_dates, val_dates, test_dates = chronological_split(matched_dates)
+    outcome_columns = ["open_to_close_pct", "next_session_return", "day2_return", "day3_return"]
+    sign = 1 if direction == "LONG" else -1
+
+    result = {"hypothesis_id": hypothesis["id"], "label": hypothesis["label"],
+              "direction": direction, "theme": theme, "tickers": tickers,
+              "n_matched_days": len(matched_dates),
+              "n_train_days": len(train_dates), "n_validation_days": len(val_dates), "n_test_days": len(test_dates)}
+
+    splits = [("train", train_dates), ("validation", val_dates), ("test", test_dates)]
+
+    for col in outcome_columns:
+        result.setdefault("stock_day", {})[col] = {
+            split_name: compute_stats(_collect_stock_day_returns(split_dates, tickers, asx_outcomes_by_ticker, col, sign), costs)
+            for split_name, split_dates in splits
+        }
+        result.setdefault("day_level", {})[col] = {
+            split_name: compute_stats(_collect_day_level_returns(split_dates, tickers, asx_outcomes_by_ticker, col, sign), costs)
+            for split_name, split_dates in splits
+        }
+        per_stock = {}
+        for t in tickers:
+            per_stock[t] = {
+                split_name: compute_stats(_collect_per_stock_returns(split_dates, t, asx_outcomes_by_ticker, col, sign), costs)
+                for split_name, split_dates in splits
+            }
+        result.setdefault("per_stock", {})[col] = per_stock
+
+    return result
+
+
+def compare_confirmed_vs_unconfirmed(base_hypothesis, confirmed_hypothesis, aligned_driver_table,
+                                      asx_outcomes_by_ticker, asx_theme_stocks, costs=None):
+    """Isolates what a confirmation driver actually added, using MATCHED
+    DATES rather than comparing headline percentages from two different
+    samples. base_hypothesis's condition must be implied by
+    confirmed_hypothesis's condition (e.g. H4 <- H4b) so that
+    confirmed's matched dates are a subset of base's.
+
+    Returns stats for:
+      - 'confirmed': days where BOTH conditions held (already reported
+        elsewhere, included here for direct side-by-side comparison)
+      - 'unconfirmed_only': days where the base condition held but the
+        extra confirming condition did NOT — the true counterfactual
+        for "did the confirmation add anything"
+    """
+    theme = base_hypothesis["theme"]
+    direction = base_hypothesis["direction"]
+    usable_from = pd.Timestamp(base_hypothesis["usable_from"])
+    tickers = asx_theme_stocks[theme]
+    sign = 1 if direction == "LONG" else -1
+
+    driver_slice = aligned_driver_table[aligned_driver_table.index >= usable_from]
+    base_dates = set(d for d in driver_slice.index if base_hypothesis["condition"](driver_slice.loc[d]))
+    confirmed_dates = set(d for d in driver_slice.index if confirmed_hypothesis["condition"](driver_slice.loc[d]))
+
+    if not confirmed_dates.issubset(base_dates):
+        return {"error": "confirmed_hypothesis condition is not a subset of base_hypothesis condition — "
+                          "not a valid confirmed-vs-unconfirmed comparison for this pair"}
+
+    unconfirmed_only_dates = sorted(base_dates - confirmed_dates)
+    confirmed_dates = sorted(confirmed_dates)
+
+    outcome_columns = ["open_to_close_pct", "next_session_return", "day2_return", "day3_return"]
+    result = {
+        "base_id": base_hypothesis["id"], "confirmed_id": confirmed_hypothesis["id"],
+        "n_confirmed_days": len(confirmed_dates), "n_unconfirmed_only_days": len(unconfirmed_only_dates),
+    }
+    for col in outcome_columns:
+        result.setdefault("confirmed", {})[col] = compute_stats(
+            _collect_day_level_returns(confirmed_dates, tickers, asx_outcomes_by_ticker, col, sign), costs)
+        result.setdefault("unconfirmed_only", {})[col] = compute_stats(
+            _collect_day_level_returns(unconfirmed_only_dates, tickers, asx_outcomes_by_ticker, col, sign), costs)
+    return result
+
+
 def evaluate_hypothesis(hypothesis, aligned_driver_table, asx_outcomes_by_ticker,
                          asx_theme_stocks, costs=None):
     """Evaluates one hypothesis across its ASX basket, split
