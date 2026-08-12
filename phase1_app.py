@@ -17,7 +17,7 @@ import streamlit as st
 import pandas as pd
 
 from config_v1 import DRIVERS, ASX_THEME_STOCKS, HYPOTHESES, COSTS
-from historical_data import build_driver_table, align_to_asx_sessions, build_asx_outcome_tables
+from historical_data import build_driver_table, align_to_asx_sessions, build_asx_outcome_tables, fetch_raw_history
 from backtest import evaluate_hypothesis
 
 st.set_page_config(page_title="Phase 1 Baseline", layout="wide")
@@ -26,13 +26,22 @@ st.caption("First untouched pass across all 18 hypotheses. Frozen once reviewed 
 
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def cached_fetch(ticker):
+    """Caches EACH TICKER individually. If a batch pull partially fails
+    and the app is re-run, tickers that already succeeded are served
+    instantly from here — only the ones that actually failed get
+    re-attempted, instead of re-pulling all ~59 from scratch."""
+    return fetch_raw_history(ticker)
+
+
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def load_driver_table():
-    return build_driver_table(list(DRIVERS.keys()))
+    return build_driver_table(list(DRIVERS.keys()), fetch_fn=cached_fetch)
 
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def load_asx_outcomes(tickers_tuple):
-    return build_asx_outcome_tables(list(tickers_tuple))
+    return build_asx_outcome_tables(list(tickers_tuple), fetch_fn=cached_fetch)
 
 
 def needed_asx_tickers():
@@ -66,13 +75,25 @@ def flatten_for_csv(results):
 
 if st.button("Run Phase 1 baseline", type="primary", use_container_width=True):
     with st.spinner("Pulling driver history (~37 tickers)..."):
-        driver_table = load_driver_table()
+        driver_table, driver_failures = load_driver_table()
     st.success(f"Driver table: {driver_table.shape[0]} rows x {driver_table.shape[1]} drivers")
+    if driver_failures:
+        st.warning(
+            f"{len(driver_failures)} driver ticker(s) failed even after retries and were skipped "
+            f"(not faked, not substituted): {', '.join(f'{n} ({t})' for n, t in driver_failures)}. "
+            f"Any hypothesis using these will show a reduced or missing sample — re-running the app "
+            f"later will only retry these, not re-pull everything."
+        )
 
     tickers_needed = needed_asx_tickers()
     with st.spinner(f"Pulling ASX outcome history ({len(tickers_needed)} tickers)..."):
-        asx_outcomes = load_asx_outcomes(tickers_needed)
-    st.success(f"ASX outcomes pulled for {len(asx_outcomes)} tickers")
+        asx_outcomes, asx_failures = load_asx_outcomes(tickers_needed)
+    st.success(f"ASX outcomes pulled for {len(asx_outcomes)} of {len(tickers_needed)} tickers")
+    if asx_failures:
+        st.warning(
+            f"{len(asx_failures)} ASX ticker(s) failed even after retries and were skipped: "
+            f"{', '.join(asx_failures)}. Baskets containing these will run on the remaining stocks only."
+        )
 
     with st.spinner("Aligning overnight drivers to ASX sessions (no look-ahead)..."):
         all_asx_dates = sorted(set().union(*[df.index for df in asx_outcomes.values() if not df.empty]))
