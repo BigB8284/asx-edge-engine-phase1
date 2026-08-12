@@ -379,6 +379,7 @@ def gap_relationship_analysis(hypothesis, aligned_driver_table, asx_outcomes_by_
 
     return {
         "hypothesis_id": hypothesis["id"], "label": hypothesis["label"], "direction": direction, "theme": theme,
+        "n_matched_days": len(matched_dates),
         "diagnostic_train_validation": bucket_and_correlate(diagnostic_dates, "train+validation (diagnostic)"),
         "held_out_test": bucket_and_correlate(test_d, "test (checked once)"),
     }
