@@ -31,37 +31,41 @@ MAX_DAYS_PER_CALL = 600  # EODHD's documented cap for 5-minute bars
 def _fetch_one_window(ticker, api_token, from_dt, to_dt, max_retries=3):
     """One paginated request, with retry/backoff on rate limiting —
     same resilience pattern as historical_data.fetch_raw_history:
-    never crash the whole pull on one bad window, return None instead."""
+    never crash the whole pull on one bad window, return (None, reason)
+    instead so a failure is diagnosable, not just a silent gap."""
     params = {"api_token": api_token, "interval": "5m", "fmt": "json",
               "from": int(from_dt.timestamp()), "to": int(to_dt.timestamp())}
+    last_reason = "unknown"
     for attempt in range(max_retries):
         try:
             resp = requests.get(BASE_URL.format(ticker=ticker), params=params, timeout=30)
             if resp.status_code == 200:
                 data = resp.json()
-                return data if data else []
+                return (data if data else [], None)
             if "Too Many Requests" in resp.text or resp.status_code == 429:
+                last_reason = f"HTTP 429 rate limited: {resp.text[:200]}"
                 time.sleep(3 * (attempt + 1))
                 continue
-            return None  # a real (non-rate-limit) error
-        except Exception:
+            return (None, f"HTTP {resp.status_code}: {resp.text[:300]}")
+        except Exception as e:
+            last_reason = f"Exception: {e}"
             time.sleep(2)
             continue
-    return None
+    return (None, last_reason)
 
 
 def fetch_full_intraday_history(ticker, api_token, start_date, end_date):
     """Paginates across MAX_DAYS_PER_CALL windows to cover the full
     requested range. Returns (all_bars_list, failed_windows) — failed
-    windows are reported, not silently skipped."""
+    windows are reported WITH THE ACTUAL REASON, not silently skipped."""
     all_bars = []
     failed_windows = []
     window_start = start_date
     while window_start < end_date:
         window_end = min(window_start + timedelta(days=MAX_DAYS_PER_CALL - 1), end_date)
-        data = _fetch_one_window(ticker, api_token, window_start, window_end)
+        data, reason = _fetch_one_window(ticker, api_token, window_start, window_end)
         if data is None:
-            failed_windows.append((str(window_start.date()), str(window_end.date())))
+            failed_windows.append((str(window_start.date()), str(window_end.date()), reason))
         else:
             all_bars.extend(data)
         window_start = window_end + timedelta(days=1)
