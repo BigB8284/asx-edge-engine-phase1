@@ -45,6 +45,15 @@ def compute_day_outcomes(bars, direction):
     if bars.empty:
         return None
 
+    # Drop any bar with missing OHLC data (real EODHD bars occasionally have
+    # null prices, especially for thin/illiquid names like BOE.AX/DYL.AX in
+    # quiet minutes) — treated as if that bar didn't exist, not fabricated.
+    # If this shifts the effective "day open" to a later bar than the true
+    # session start, that's a known, documented fallback, not silent.
+    bars = bars.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+    if bars.empty:
+        return None
+
     open_price = bars.iloc[0]["open"]
     result = {"open_price": open_price, "n_bars": len(bars)}
 
@@ -99,6 +108,12 @@ def compute_day_outcomes(bars, direction):
             continue
         mfe = sub["favourable_extreme"].max()
         mae = sub["adverse_extreme"].min()
+        if pd.isna(mfe) or pd.isna(mae):
+            # Defensive fallback: shouldn't happen after the top-level dropna,
+            # but if a window subset somehow ends up all-NaN, degrade to
+            # "no data for this window" rather than crash the whole day.
+            window_results[w] = {"mfe": None, "mae": None, "time_to_mfe_minutes": None}
+            continue
         mfe_row = sub[sub["favourable_extreme"] == mfe].iloc[0]
         window_results[w] = {"mfe": round(mfe, 4), "mae": round(mae, 4),
                              "time_to_mfe_minutes": int(mfe_row["minutes_from_open"])}
