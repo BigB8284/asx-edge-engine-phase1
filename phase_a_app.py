@@ -53,10 +53,23 @@ def load_driver_table():
     return build_driver_table(list(DRIVERS.keys()), fetch_fn=cached_fetch_daily, drivers_lookup=DRIVERS)
 
 
+def to_eodhd_ticker(yahoo_ticker):
+    """This project uses Yahoo Finance's .AX suffix everywhere (matching
+    ASX_THEME_STOCKS and every yfinance-based call in V1/V2). EODHD uses
+    a different suffix, .AU, for the same exchange. This conversion
+    happens ONLY at the EODHD call boundary — everything else (dict
+    keys, theme lookups, display labels) stays in .AX form throughout,
+    so this is the one place the two conventions meet."""
+    if yahoo_ticker.endswith(".AX"):
+        return yahoo_ticker[:-3] + ".AU"
+    return yahoo_ticker
+
+
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def load_intraday_for_ticker(ticker):
+    eodhd_ticker = to_eodhd_ticker(ticker)
     end = datetime.now(timezone.utc)
-    raw_bars, failed_windows = fetch_full_intraday_history(ticker, EODHD_TOKEN, INTRADAY_START, end)
+    raw_bars, failed_windows = fetch_full_intraday_history(eodhd_ticker, EODHD_TOKEN, INTRADAY_START, end)
     clean_days, excluded_days, flagged_moves, outside_info = build_clean_day_groups(raw_bars)
     return clean_days, excluded_days, flagged_moves, outside_info, failed_windows
 
