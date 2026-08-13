@@ -98,12 +98,13 @@ def align_to_asx_sessions(driver_table, asx_dates):
     timezone/DST handling, since that operates on wall-clock cutoffs,
     not whole trading dates — this simplification applies to Phase 1 only.)
     """
-    asx_dates = pd.to_datetime(sorted(asx_dates))
+    asx_dates = pd.to_datetime(sorted(asx_dates)).astype("datetime64[ns]")
     driver_table = driver_table.sort_index()
 
     left = pd.DataFrame({"asx_date": asx_dates})
     right = driver_table.reset_index()
     right = right.rename(columns={right.columns[0]: "driver_date"})  # positional, not name-dependent
+    right["driver_date"] = pd.to_datetime(right["driver_date"]).astype("datetime64[ns]")
 
     merged = pd.merge_asof(
         left, right,
