@@ -430,6 +430,86 @@ def compare_confirmed_vs_unconfirmed(base_hypothesis, confirmed_hypothesis, alig
     return result
 
 
+def leave_one_out_analysis(hypothesis, aligned_driver_table, asx_outcomes_by_ticker,
+                            asx_theme_stocks, costs=None):
+    """Does the basket-level result survive removing any ONE stock? For
+    each ticker in the basket, recomputes the day-level (basket-average)
+    result using only the OTHER tickers, per split. If dropping any
+    single name collapses or flips the sign, the "basket" result was
+    substantially that one name, not a broad effect — a stronger,
+    more direct test than eyeballing per-stock consistency separately.
+    """
+    theme = hypothesis["theme"]
+    direction = hypothesis["direction"]
+    usable_from = pd.Timestamp(hypothesis["usable_from"])
+    tickers = asx_theme_stocks[theme]
+    sign = 1 if direction == "LONG" else -1
+
+    driver_slice = aligned_driver_table[aligned_driver_table.index >= usable_from]
+    matched_dates = [d for d in driver_slice.index if hypothesis["condition"](driver_slice.loc[d])]
+    if not matched_dates:
+        return {"hypothesis_id": hypothesis["id"], "n_matched_days": 0, "note": "No historical matches found"}
+
+    train_d, val_d, test_d = chronological_split(matched_dates)
+    splits = [("train", train_d), ("validation", val_d), ("test", test_d)]
+    col = "open_to_close_pct"
+
+    result = {"hypothesis_id": hypothesis["id"], "label": hypothesis["label"], "n_matched_days": len(matched_dates),
+              "full_basket": {s: compute_stats(_collect_day_level_returns(d, tickers, asx_outcomes_by_ticker, col, sign), costs)
+                              for s, d in splits}}
+
+    for excluded in tickers:
+        remaining = [t for t in tickers if t != excluded]
+        result.setdefault("leave_one_out", {})[excluded] = {
+            s: compute_stats(_collect_day_level_returns(d, remaining, asx_outcomes_by_ticker, col, sign), costs)
+            for s, d in splits
+        }
+    return result
+
+
+def regime_stability_analysis(hypothesis, aligned_driver_table, asx_outcomes_by_ticker,
+                               asx_theme_stocks, costs=None, n_periods=4):
+    """Divides the FULL matched history (not train/val/test — a
+    different cut, by calendar time) into n_periods consecutive,
+    roughly equal chunks, and checks whether the result holds up
+    across each, or is concentrated in one narrow historical regime
+    (e.g. a single commodity bull run). Diagnostic, not a new
+    train/val/test — no threshold is chosen or touched here.
+    """
+    theme = hypothesis["theme"]
+    direction = hypothesis["direction"]
+    usable_from = pd.Timestamp(hypothesis["usable_from"])
+    tickers = asx_theme_stocks[theme]
+    sign = 1 if direction == "LONG" else -1
+
+    driver_slice = aligned_driver_table[aligned_driver_table.index >= usable_from]
+    matched_dates = sorted(d for d in driver_slice.index if hypothesis["condition"](driver_slice.loc[d]))
+    if not matched_dates:
+        return {"hypothesis_id": hypothesis["id"], "n_matched_days": 0, "note": "No historical matches found"}
+
+    n = len(matched_dates)
+    chunk_size = max(1, n // n_periods)
+    periods = []
+    for i in range(n_periods):
+        start = i * chunk_size
+        end = (i + 1) * chunk_size if i < n_periods - 1 else n
+        chunk_dates = matched_dates[start:end]
+        if not chunk_dates:
+            continue
+        periods.append({
+            "period_index": i, "start_date": str(chunk_dates[0].date()), "end_date": str(chunk_dates[-1].date()),
+            "n_days": len(chunk_dates),
+            "stats": compute_stats(_collect_day_level_returns(chunk_dates, tickers, asx_outcomes_by_ticker, "open_to_close_pct", sign), costs),
+        })
+
+    signs = [1 if p["stats"].get("expectancy_net", 0) > 0 else (-1 if p["stats"].get("expectancy_net", 0) < 0 else 0)
+             for p in periods if p["stats"].get("n", 0) > 0]
+    all_same_sign = len(set(signs)) == 1 if signs else False
+
+    return {"hypothesis_id": hypothesis["id"], "label": hypothesis["label"], "n_matched_days": n,
+            "periods": periods, "consistent_across_all_periods": all_same_sign}
+
+
 def evaluate_hypothesis(hypothesis, aligned_driver_table, asx_outcomes_by_ticker,
                          asx_theme_stocks, costs=None):
     """Evaluates one hypothesis across its ASX basket, split
