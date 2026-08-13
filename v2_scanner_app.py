@@ -45,7 +45,7 @@ def cached_fetch(ticker):
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def load_driver_table():
-    return build_driver_table(list(DRIVERS.keys()), fetch_fn=cached_fetch)
+    return build_driver_table(list(DRIVERS.keys()), fetch_fn=cached_fetch, drivers_lookup=DRIVERS)
 
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
