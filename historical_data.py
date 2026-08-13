@@ -52,21 +52,28 @@ def compute_valid_pct_change(hist, gap_threshold_days=PER_OBSERVATION_GAP_NULL_T
     return pd.Series(pct_change, index=dates, name="pct_change")
 
 
-def build_driver_table(driver_names=None, fetch_fn=None):
+def build_driver_table(driver_names=None, fetch_fn=None, drivers_lookup=None):
     """Wide table: index = driver's own trading date, one column per
     named driver, values = % change (NaN where nulled or missing).
     NOT yet aligned to ASX sessions — see align_to_asx_sessions.
+
+    drivers_lookup defaults to config_v1.DRIVERS for backward
+    compatibility (phase1_app.py's existing calls keep working
+    unchanged) — pass config_v2.DRIVERS explicitly when driver_names
+    includes anything V1 doesn't know about (e.g. "rare_earths",
+    "us10y_yield"), or this will KeyError exactly like it just did.
 
     Returns (table, failed) — failed is a list of (name, ticker) pairs
     that never returned data even after retries. Never silently drops
     them without telling you.
     """
     fetch_fn = fetch_fn or fetch_raw_history
-    driver_names = driver_names or list(DRIVERS.keys())
+    drivers_lookup = drivers_lookup if drivers_lookup is not None else DRIVERS
+    driver_names = driver_names or list(drivers_lookup.keys())
     series_list = []
     failed = []
     for name in driver_names:
-        ticker, role, first_available, notes = DRIVERS[name]
+        ticker, role, first_available, notes = drivers_lookup[name]
         hist = fetch_fn(ticker)
         time.sleep(0.5)  # pacing between requests, reduces chance of triggering throttling at all
         if hist is None or hist.empty:
