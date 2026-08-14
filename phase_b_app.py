@@ -13,10 +13,22 @@ real data. Nothing here optimises, searches, or adjusts that rule.
 
 This is discovery research, not the live scanner. Frozen V1/V2 results
 and Phase A are untouched by anything in this file.
+
+MEMORY FIX (2026-08-14): originally fetched and held all 39 tickers'
+full intraday history in memory simultaneously (in a `ticker_data`
+dict AND duplicated again by Streamlit's cache_data copy-on-read),
+which blew past Streamlit Community Cloud's memory limit mid-run.
+Restructured to process one ticker at a time: fetch, score against
+every hypothesis that uses it, append results, then let it fall out
+of scope before moving to the next ticker. Scoring math is unchanged —
+only the order of operations and what's held in memory at once. Cache
+is also capped to 1 entry so old tickers' raw bars get evicted, not
+just locally released.
 """
 
 import streamlit as st
 import pandas as pd
+from collections import defaultdict
 from datetime import datetime, timezone
 
 from config_v2 import DRIVERS, ASX_THEME_STOCKS, HYPOTHESES
@@ -59,7 +71,11 @@ def load_driver_table():
     return build_driver_table(list(DRIVERS.keys()), fetch_fn=cached_fetch_daily, drivers_lookup=DRIVERS)
 
 
-@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+# max_entries=1: only the ticker currently being processed needs to stay
+# cached. Without this cap, Streamlit's cache keeps every ticker's raw
+# intraday history resident for the whole run on top of the working copy —
+# that's what caused the OOM kill.
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False, max_entries=1)
 def load_intraday_for_ticker(ticker):
     eodhd_ticker = to_eodhd_ticker(ticker)
     end = datetime.now(timezone.utc)
@@ -94,6 +110,21 @@ def get_anchor_stats(agg):
     return agg["thresholds"].get(CLASSIFICATION_ANCHOR_THRESHOLD_PCT)
 
 
+def build_ticker_to_themes():
+    m = defaultdict(set)
+    for theme, theme_tickers in ASX_THEME_STOCKS.items():
+        for t in theme_tickers:
+            m[t].add(theme)
+    return m
+
+
+def build_theme_to_hypotheses():
+    m = defaultdict(list)
+    for h in HYPOTHESES:
+        m[h["theme"]].append(h)
+    return m
+
+
 if st.button("Run Phase B (full universe)", type="primary", use_container_width=True):
     with st.spinner("Pulling driver history..."):
         driver_table, driver_failures = load_driver_table()
@@ -103,61 +134,55 @@ if st.button("Run Phase B (full universe)", type="primary", use_container_width=
     tickers = all_needed_tickers()
     st.info(f"Full universe: {len(tickers)} tickers across 11 themes: {tickers}")
 
-    ticker_data = {}
-    progress = st.progress(0, text="Pulling intraday history...")
-    for i, t in enumerate(tickers):
-        clean_days, excluded, flagged, outside, failed = load_intraday_for_ticker(t)
-        ticker_data[t] = {"clean_days": clean_days, "excluded": excluded, "flagged": flagged, "failed": failed}
-        progress.progress((i + 1) / len(tickers), text=f"{t}: {len(clean_days)} clean days ({i+1}/{len(tickers)})")
-    progress.empty()
-
-    fail_summary = [(t, td["failed"]) for t, td in ticker_data.items() if td["failed"]]
-    if fail_summary:
-        st.warning(f"{len(fail_summary)} ticker(s) had at least one failed fetch window: {[t for t, _ in fail_summary]}")
-
-    all_asx_dates = sorted(set().union(*[
-        set(pd.Timestamp(d) for d in td["clean_days"].keys()) for td in ticker_data.values() if td["clean_days"]
-    ]))
-    if not all_asx_dates:
-        st.error("No clean intraday days found anywhere — stopping.")
-        st.stop()
-
-    with st.spinner("Aligning overnight drivers to ASX sessions..."):
-        aligned = align_to_asx_sessions(driver_table, all_asx_dates)
-
-    baseline_cache = {}  # (ticker, direction) -> aggregated baseline stats, reused across hypotheses that share it
-
-    def get_baseline(ticker, direction):
-        key = (ticker, direction)
-        if key not in baseline_cache:
-            clean_days = ticker_data.get(ticker, {}).get("clean_days", {})
-            outcomes = [compute_day_outcomes(bars, direction) for bars in clean_days.values()]
-            baseline_cache[key] = aggregate_outcomes([o for o in outcomes if o is not None])
-        return baseline_cache[key]
+    ticker_to_themes = build_ticker_to_themes()
+    theme_to_hypotheses = build_theme_to_hypotheses()
 
     all_summary_rows = []
     full_detail_rows = []
+    fail_summary = []
+    any_clean_days_found = False
 
-    hyp_progress = st.progress(0, text="Scoring hypotheses...")
-    for hi, h in enumerate(HYPOTHESES):
-        hid = h["id"]
-        direction = h["direction"]
-        theme = h["theme"]
-        theme_tickers = ASX_THEME_STOCKS[theme]
-        status = h.get("status", "")
-        sign_note = h.get("driver_sign_convention", "")
-        usable_from = pd.Timestamp(h["usable_from"])
+    progress = st.progress(0, text="Processing tickers...")
+    for i, ticker in enumerate(tickers):
+        clean_days, excluded_days, flagged_moves, outside_info, failed_windows = load_intraday_for_ticker(ticker)
 
-        driver_slice = aligned[aligned.index >= usable_from]
-        matched_dates = [d for d in driver_slice.index if h["condition"](driver_slice.loc[d])]
-        train_d, val_d, test_d = chronological_split(matched_dates)
-        split_dates = {"train": train_d, "validation": val_d, "test": test_d}
+        if failed_windows:
+            fail_summary.append((ticker, failed_windows))
 
-        for ticker in theme_tickers:
-            clean_days = ticker_data.get(ticker, {}).get("clean_days", {})
-            if not clean_days:
-                continue
-            baseline_agg = get_baseline(ticker, direction)
+        if not clean_days:
+            progress.progress((i + 1) / len(tickers), text=f"{ticker}: no clean days ({i + 1}/{len(tickers)})")
+            continue
+
+        any_clean_days_found = True
+
+        # Align drivers to THIS ticker's own trading dates only — equivalent
+        # to the old global-union approach, since outcomes_for_dates() was
+        # always filtering down to per-ticker dates anyway.
+        ticker_dates = sorted(pd.Timestamp(d) for d in clean_days.keys())
+        aligned = align_to_asx_sessions(driver_table, ticker_dates)
+
+        relevant_themes = ticker_to_themes.get(ticker, set())
+        relevant_hypotheses = [h for theme in relevant_themes for h in theme_to_hypotheses.get(theme, [])]
+
+        baseline_cache_for_ticker = {}  # direction -> aggregated baseline, reused across hypotheses sharing a direction
+
+        for h in relevant_hypotheses:
+            hid = h["id"]
+            direction = h["direction"]
+            theme = h["theme"]
+            status = h.get("status", "")
+            sign_note = h.get("driver_sign_convention", "")
+            usable_from = pd.Timestamp(h["usable_from"])
+
+            driver_slice = aligned[aligned.index >= usable_from]
+            matched_dates = [d for d in driver_slice.index if h["condition"](driver_slice.loc[d])]
+            train_d, val_d, test_d = chronological_split(matched_dates)
+            split_dates = {"train": train_d, "validation": val_d, "test": test_d}
+
+            if direction not in baseline_cache_for_ticker:
+                outcomes = [compute_day_outcomes(bars, direction) for bars in clean_days.values()]
+                baseline_cache_for_ticker[direction] = aggregate_outcomes([o for o in outcomes if o is not None])
+            baseline_agg = baseline_cache_for_ticker[direction]
 
             split_aggs = {}
             for split_name, dates in split_dates.items():
@@ -217,8 +242,21 @@ if st.button("Run Phase B (full universe)", type="primary", use_container_width=
                         "median_time_to_mfe_min": agg["windows"][w]["median_time_to_mfe_min"],
                     })
 
-        hyp_progress.progress((hi + 1) / len(HYPOTHESES), text=f"Scored {hid} ({hi+1}/{len(HYPOTHESES)})")
-    hyp_progress.empty()
+        progress.progress(
+            (i + 1) / len(tickers),
+            text=f"{ticker}: {len(clean_days)} clean days, {len(relevant_hypotheses)} hypotheses scored ({i + 1}/{len(tickers)})",
+        )
+        # clean_days / aligned / baseline_cache_for_ticker fall out of scope
+        # on the next loop iteration — nothing carried over between tickers.
+
+    progress.empty()
+
+    if fail_summary:
+        st.warning(f"{len(fail_summary)} ticker(s) had at least one failed fetch window: {[t for t, _ in fail_summary]}")
+
+    if not any_clean_days_found:
+        st.error("No clean intraday days found anywhere — stopping.")
+        st.stop()
 
     summary_df = pd.DataFrame(all_summary_rows)
     grade_order = {"A": 0, "B": 1, "C": 2}
