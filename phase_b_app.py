@@ -228,3 +228,85 @@ if st.button("Run Phase B (full universe)", type="primary", use_container_width=
                 "baseline_n": baseline_agg["n_days"],
                 "val_delta_pp": round(val_delta, 1) if val_delta is not None else None,
                 "test_delta_pp": round(test_delta, 1) if test_delta is not None else None,
+                "stability_min_delta_pp": round(min(val_delta, test_delta), 1) if (val_delta is not None and test_delta is not None) else None,
+            })
+
+            for split_name, agg in split_aggs.items():
+                if agg is None or agg["n_days"] == 0:
+                    continue
+                delta = compute_baseline_delta(agg, baseline_agg)
+                for t in THRESHOLDS:
+                    for cp in CHECKPOINTS:
+                        d = delta["checkpoints"][cp][t]
+                        full_detail_rows.append({
+                            "hypothesis_id": hid, "theme": theme, "direction": direction, "ticker": ticker,
+                            "status": status, "inverted_sign": bool(sign_note), "grade": grade,
+                            "split": split_name, "threshold_pct": t, "checkpoint": cp,
+                            "signal_probability": d["signal_probability"], "signal_n": d["signal_n"],
+                            "baseline_probability": d["baseline_probability"], "baseline_n": d["baseline_n"],
+                            "delta_pp": d["delta_pp"],
+                            "median_time_to_threshold_min": agg["thresholds"][t]["median_time_to_threshold_min"],
+                            "median_mae_before_reached": agg["thresholds"][t]["median_mae_before_reached"],
+                        })
+                for w in MFE_MAE_WINDOWS:
+                    full_detail_rows.append({
+                        "hypothesis_id": hid, "theme": theme, "direction": direction, "ticker": ticker,
+                        "status": status, "inverted_sign": bool(sign_note), "grade": grade,
+                        "split": split_name, "window": str(w), "metric": "MFE_MAE",
+                        "median_mfe": agg["windows"][w]["median_mfe"], "median_mae": agg["windows"][w]["median_mae"],
+                        "median_time_to_mfe_min": agg["windows"][w]["median_time_to_mfe_min"],
+                    })
+
+        progress.progress(
+            (i + 1) / len(tickers),
+            text=f"{ticker}: {len(clean_days)} clean days, {len(relevant_hypotheses)} hypotheses scored ({i + 1}/{len(tickers)})",
+        )
+        gc.collect()
+        mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        print(f"[{i + 1}/{len(tickers)}] {ticker}: {len(clean_days)} clean days, "
+              f"{len(relevant_hypotheses)} hypotheses, summary_rows={len(all_summary_rows)}, "
+              f"detail_rows={len(full_detail_rows)}, peak RSS so far: {mem_mb:.0f} MB", flush=True)
+        # clean_days / aligned / baseline_cache_for_ticker fall out of scope
+        # on the next loop iteration — nothing carried over between tickers.
+
+    progress.empty()
+
+    if fail_summary:
+        st.warning(f"{len(fail_summary)} ticker(s) had at least one failed fetch window: {[t for t, _ in fail_summary]}")
+
+    if not any_clean_days_found:
+        st.error("No clean intraday days found anywhere — stopping.")
+        st.stop()
+
+    summary_df = pd.DataFrame(all_summary_rows)
+    grade_order = {"A": 0, "B": 1, "C": 2}
+    summary_df["_sort"] = summary_df["grade"].map(grade_order)
+    summary_df = summary_df.sort_values(["_sort", "stability_min_delta_pp"], ascending=[True, False]).drop(columns="_sort")
+
+    st.divider()
+    st.subheader(f"Ranked summary — all {len(summary_df)} (hypothesis, ticker) pairs")
+    st.caption(f"Grading anchor: +{CLASSIFICATION_ANCHOR_THRESHOLD_PCT:.0f}% threshold, {CLASSIFICATION_ANCHOR_CHECKPOINT}. Ranked by grade, then by worst-of-(validation,test) delta — stability first, not a spectacular single split.")
+
+    for grade in ["A", "B", "C"]:
+        subset = summary_df[summary_df["grade"] == grade]
+        st.markdown(f"### Grade {grade} — {len(subset)} pairs")
+        if subset.empty:
+            st.write("None.")
+            continue
+        display_cols = ["hypothesis_id", "theme", "direction", "ticker", "status", "inverted_sign",
+                        "val_signal_prob_2pct", "val_n", "test_signal_prob_2pct", "test_n",
+                        "baseline_prob_2pct", "val_delta_pp", "test_delta_pp"]
+        st.dataframe(subset[display_cols], use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Downloads")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button("Ranked summary CSV (A/B/C, +2% anchor)", data=summary_df.to_csv(index=False),
+                            file_name="phase_b_summary.csv", mime="text/csv", use_container_width=True)
+    with c2:
+        st.download_button("Full detail CSV (all thresholds/checkpoints/windows)", data=pd.DataFrame(full_detail_rows).to_csv(index=False),
+                            file_name="phase_b_full_detail.csv", mime="text/csv", use_container_width=True)
+    st.caption("Full detail CSV has every 1/2/3/5% threshold x every checkpoint x every MFE/MAE window, per split — the +2%/full_session anchor above is only the grading cut, not the whole picture.")
+else:
+    st.info(f"Tap to run. {len(HYPOTHESES)} hypotheses across 11 themes — this pulls intraday history for the full ticker universe and will take considerably longer than Phase A's 8-ticker run.")
