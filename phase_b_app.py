@@ -18,26 +18,31 @@ MEMORY FIX (2026-08-14): originally fetched and held all 39 tickers'
 full intraday history in memory simultaneously (in a `ticker_data`
 dict AND duplicated again by Streamlit's cache_data copy-on-read),
 which blew past Streamlit Community Cloud's memory limit mid-run.
-Restructured to process one ticker at a time: fetch, score against
-every hypothesis that uses it, append results, then let it fall out
-of scope before moving to the next ticker. Scoring math is unchanged —
-only the order of operations and what's held in memory at once. Cache
-is also capped to 1 entry so old tickers' raw bars get evicted, not
-just locally released.
+First restructured to process one ticker at a time within a single
+run; that raised the ceiling (got to ticker 24/39 cleanly, peak RSS
+548MB, plateaued rather than climbing linearly) but something in the
+24-39 range still killed the process with no traceback.
 
-DIAGNOSTIC LOGGING (2026-08-14): app still hit resource limits after
-the above fix, with no traceback (OOM-kill signature) and no browser-
-side evidence of where it died, since the crash wipes the progress bar
-along with the rest of the page. Added a per-ticker memory checkpoint
-that prints to the SERVER-SIDE log (survives independently of the
-browser tab) so we can see exactly which ticker it dies on and how
-memory climbs leading up to it.
+BATCHING (2026-08-14): rather than keep chasing the exact ticker/stage
+that trips the limit in one continuous 39-ticker run, this now runs in
+fixed batches of 8 tickers — the same scale Phase A already proved
+reliable. Each batch is a separate button press producing its own pair
+of CSVs. Run all batches in sequence (order doesn't matter, they're
+independent), download each pair, send all of them back for the
+combined report. If one batch ever fails, only that batch needs
+re-running — everything else already downloaded is safe.
+
+Per-ticker diagnostic logging (fetch stage vs scoring stage, memory
+checkpoint at each) is kept in case a batch still fails, so we can see
+exactly where.
 """
 
 import streamlit as st
 import pandas as pd
 from collections import defaultdict
 from datetime import datetime, timezone
+import resource
+import gc
 
 from config_v2 import DRIVERS, ASX_THEME_STOCKS, HYPOTHESES
 from historical_data import build_driver_table, align_to_asx_sessions, fetch_raw_history
@@ -48,15 +53,15 @@ from intraday_stats import aggregate_outcomes, compute_baseline_delta, format_su
 from phase_b_classification import (
     classify_finding, CLASSIFICATION_ANCHOR_THRESHOLD_PCT, CLASSIFICATION_ANCHOR_CHECKPOINT,
 )
-import resource
-import gc
 
 st.set_page_config(page_title="Phase B — Full Universe Discovery", layout="wide")
 st.title("Phase B — Full Universe Intraday Discovery")
 st.caption("All 34 hypotheses, all 11 themes. Discovery research using the Phase A-validated engine, unchanged. Not the live scanner.")
+st.caption("Runs in batches of 8 tickers (Phase A's proven scale) instead of all 39 at once. Run every batch below, in any order, then send all downloaded CSVs back together.")
 
 by_id = {h["id"]: h for h in HYPOTHESES}
 INTRADAY_START = datetime(2020, 10, 12, tzinfo=timezone.utc)
+BATCH_SIZE = 8
 
 try:
     EODHD_TOKEN = st.secrets["EODHD_API_TOKEN"]
@@ -83,8 +88,7 @@ def load_driver_table():
 
 # max_entries=1: only the ticker currently being processed needs to stay
 # cached. Without this cap, Streamlit's cache keeps every ticker's raw
-# intraday history resident for the whole run on top of the working copy —
-# that's what caused the original OOM kill.
+# intraday history resident for the whole run on top of the working copy.
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False, max_entries=1)
 def load_intraday_for_ticker(ticker):
     eodhd_ticker = to_eodhd_ticker(ticker)
@@ -135,14 +139,11 @@ def build_theme_to_hypotheses():
     return m
 
 
-if st.button("Run Phase B (full universe)", type="primary", use_container_width=True):
+def run_batch(batch_tickers, batch_num, total_batches):
     with st.spinner("Pulling driver history..."):
         driver_table, driver_failures = load_driver_table()
     if driver_failures:
         st.warning(f"{len(driver_failures)} driver ticker(s) failed: {driver_failures}")
-
-    tickers = all_needed_tickers()
-    st.info(f"Full universe: {len(tickers)} tickers across 11 themes: {tickers}")
 
     ticker_to_themes = build_ticker_to_themes()
     theme_to_hypotheses = build_theme_to_hypotheses()
@@ -152,27 +153,29 @@ if st.button("Run Phase B (full universe)", type="primary", use_container_width=
     fail_summary = []
     any_clean_days_found = False
 
-    print(f"=== Phase B run starting: {len(tickers)} tickers ===", flush=True)
+    print(f"=== Phase B batch {batch_num}/{total_batches} starting: {len(batch_tickers)} tickers: {batch_tickers} ===", flush=True)
 
     progress = st.progress(0, text="Processing tickers...")
-    for i, ticker in enumerate(tickers):
+    for i, ticker in enumerate(batch_tickers):
+        mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        print(f"[batch {batch_num}] [{i + 1}/{len(batch_tickers)}] {ticker}: STARTING FETCH, peak RSS so far: {mem_mb:.0f} MB", flush=True)
+
         clean_days, excluded_days, flagged_moves, outside_info, failed_windows = load_intraday_for_ticker(ticker)
+
+        gc.collect()
+        mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        print(f"[batch {batch_num}] [{i + 1}/{len(batch_tickers)}] {ticker}: fetch done, {len(clean_days)} clean days, "
+              f"peak RSS so far: {mem_mb:.0f} MB", flush=True)
 
         if failed_windows:
             fail_summary.append((ticker, failed_windows))
 
         if not clean_days:
-            progress.progress((i + 1) / len(tickers), text=f"{ticker}: no clean days ({i + 1}/{len(tickers)})")
-            gc.collect()
-            mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-            print(f"[{i + 1}/{len(tickers)}] {ticker}: no clean days, peak RSS so far: {mem_mb:.0f} MB", flush=True)
+            progress.progress((i + 1) / len(batch_tickers), text=f"{ticker}: no clean days ({i + 1}/{len(batch_tickers)})")
             continue
 
         any_clean_days_found = True
 
-        # Align drivers to THIS ticker's own trading dates only — equivalent
-        # to the old global-union approach, since outcomes_for_dates() was
-        # always filtering down to per-ticker dates anyway.
         ticker_dates = sorted(pd.Timestamp(d) for d in clean_days.keys())
         aligned = align_to_asx_sessions(driver_table, ticker_dates)
 
@@ -258,16 +261,14 @@ if st.button("Run Phase B (full universe)", type="primary", use_container_width=
                     })
 
         progress.progress(
-            (i + 1) / len(tickers),
-            text=f"{ticker}: {len(clean_days)} clean days, {len(relevant_hypotheses)} hypotheses scored ({i + 1}/{len(tickers)})",
+            (i + 1) / len(batch_tickers),
+            text=f"{ticker}: {len(clean_days)} clean days, {len(relevant_hypotheses)} hypotheses scored ({i + 1}/{len(batch_tickers)})",
         )
         gc.collect()
         mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-        print(f"[{i + 1}/{len(tickers)}] {ticker}: {len(clean_days)} clean days, "
+        print(f"[batch {batch_num}] [{i + 1}/{len(batch_tickers)}] {ticker}: SCORING DONE, {len(clean_days)} clean days, "
               f"{len(relevant_hypotheses)} hypotheses, summary_rows={len(all_summary_rows)}, "
               f"detail_rows={len(full_detail_rows)}, peak RSS so far: {mem_mb:.0f} MB", flush=True)
-        # clean_days / aligned / baseline_cache_for_ticker fall out of scope
-        # on the next loop iteration — nothing carried over between tickers.
 
     progress.empty()
 
@@ -275,8 +276,8 @@ if st.button("Run Phase B (full universe)", type="primary", use_container_width=
         st.warning(f"{len(fail_summary)} ticker(s) had at least one failed fetch window: {[t for t, _ in fail_summary]}")
 
     if not any_clean_days_found:
-        st.error("No clean intraday days found anywhere — stopping.")
-        st.stop()
+        st.error("No clean intraday days found anywhere in this batch — nothing to show.")
+        return
 
     summary_df = pd.DataFrame(all_summary_rows)
     grade_order = {"A": 0, "B": 1, "C": 2}
@@ -284,8 +285,9 @@ if st.button("Run Phase B (full universe)", type="primary", use_container_width=
     summary_df = summary_df.sort_values(["_sort", "stability_min_delta_pp"], ascending=[True, False]).drop(columns="_sort")
 
     st.divider()
-    st.subheader(f"Ranked summary — all {len(summary_df)} (hypothesis, ticker) pairs")
-    st.caption(f"Grading anchor: +{CLASSIFICATION_ANCHOR_THRESHOLD_PCT:.0f}% threshold, {CLASSIFICATION_ANCHOR_CHECKPOINT}. Ranked by grade, then by worst-of-(validation,test) delta — stability first, not a spectacular single split.")
+    st.subheader(f"Batch {batch_num}/{total_batches} — {len(summary_df)} (hypothesis, ticker) pairs")
+    st.caption(f"Tickers in this batch: {', '.join(batch_tickers)}")
+    st.caption(f"Grading anchor: +{CLASSIFICATION_ANCHOR_THRESHOLD_PCT:.0f}% threshold, {CLASSIFICATION_ANCHOR_CHECKPOINT}.")
 
     for grade in ["A", "B", "C"]:
         subset = summary_df[summary_df["grade"] == grade]
@@ -302,11 +304,24 @@ if st.button("Run Phase B (full universe)", type="primary", use_container_width=
     st.subheader("Downloads")
     c1, c2 = st.columns(2)
     with c1:
-        st.download_button("Ranked summary CSV (A/B/C, +2% anchor)", data=summary_df.to_csv(index=False),
-                            file_name="phase_b_summary.csv", mime="text/csv", use_container_width=True)
+        st.download_button(f"Batch {batch_num} summary CSV", data=summary_df.to_csv(index=False),
+                            file_name=f"phase_b_summary_batch{batch_num}.csv", mime="text/csv",
+                            use_container_width=True, key=f"summary_dl_{batch_num}")
     with c2:
-        st.download_button("Full detail CSV (all thresholds/checkpoints/windows)", data=pd.DataFrame(full_detail_rows).to_csv(index=False),
-                            file_name="phase_b_full_detail.csv", mime="text/csv", use_container_width=True)
-    st.caption("Full detail CSV has every 1/2/3/5% threshold x every checkpoint x every MFE/MAE window, per split — the +2%/full_session anchor above is only the grading cut, not the whole picture.")
-else:
-    st.info(f"Tap to run. {len(HYPOTHESES)} hypotheses across 11 themes — this pulls intraday history for the full ticker universe and will take considerably longer than Phase A's 8-ticker run.")
+        st.download_button(f"Batch {batch_num} full detail CSV", data=pd.DataFrame(full_detail_rows).to_csv(index=False),
+                            file_name=f"phase_b_full_detail_batch{batch_num}.csv", mime="text/csv",
+                            use_container_width=True, key=f"detail_dl_{batch_num}")
+
+
+# ---- Batch layout, computed once at page load ----
+all_tickers = all_needed_tickers()
+batches = [all_tickers[i:i + BATCH_SIZE] for i in range(0, len(all_tickers), BATCH_SIZE)]
+
+st.divider()
+st.subheader(f"Run each batch below ({len(batches)} batches, {len(all_tickers)} tickers total)")
+st.caption("Order doesn't matter — each batch is independent. Run all of them, download every CSV, send them all back together.")
+
+for batch_num, batch_tickers in enumerate(batches, start=1):
+    with st.expander(f"Batch {batch_num} of {len(batches)} — {len(batch_tickers)} tickers: {', '.join(batch_tickers)}"):
+        if st.button(f"Run Batch {batch_num}", type="primary", use_container_width=True, key=f"run_{batch_num}"):
+            run_batch(batch_tickers, batch_num, len(batches))
