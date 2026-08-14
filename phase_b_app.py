@@ -15,26 +15,27 @@ This is discovery research, not the live scanner. Frozen V1/V2 results
 and Phase A are untouched by anything in this file.
 
 MEMORY FIX (2026-08-14): originally fetched and held all 39 tickers'
-full intraday history in memory simultaneously (in a `ticker_data`
-dict AND duplicated again by Streamlit's cache_data copy-on-read),
-which blew past Streamlit Community Cloud's memory limit mid-run.
-First restructured to process one ticker at a time within a single
-run; that raised the ceiling (got to ticker 24/39 cleanly, peak RSS
-548MB, plateaued rather than climbing linearly) but something in the
-24-39 range still killed the process with no traceback.
+full intraday history in memory simultaneously, which blew past
+Streamlit Community Cloud's memory limit mid-run. Restructured to
+process one ticker at a time within a run.
 
-BATCHING (2026-08-14): rather than keep chasing the exact ticker/stage
-that trips the limit in one continuous 39-ticker run, this now runs in
-fixed batches of 8 tickers — the same scale Phase A already proved
-reliable. Each batch is a separate button press producing its own pair
-of CSVs. Run all batches in sequence (order doesn't matter, they're
-independent), download each pair, send all of them back for the
-combined report. If one batch ever fails, only that batch needs
-re-running — everything else already downloaded is safe.
+BATCHING (2026-08-14): runs in fixed batches of 8 tickers — the same
+scale Phase A already proved reliable — instead of all 39 at once.
+Each batch is its own button press producing its own pair of CSVs.
+
+SESSION STATE FIX (2026-08-14): st.download_button triggers a full
+script rerun on click. Batch results were only living in local
+variables inside the button's if-block, so clicking the FIRST download
+button reran the script, "Run Batch N" was no longer True, and the
+second download vanished — forcing a full batch re-run just to get the
+other file. Fixed by computing each batch's results once, then storing
+them in st.session_state keyed by batch number. Display + both
+download buttons now render from session_state on every rerun, so they
+survive downloading, switching between expanders, etc. without
+re-running the (expensive) fetch/scoring work.
 
 Per-ticker diagnostic logging (fetch stage vs scoring stage, memory
-checkpoint at each) is kept in case a batch still fails, so we can see
-exactly where.
+checkpoint at each) is kept in case a batch still fails.
 """
 
 import streamlit as st
@@ -57,7 +58,7 @@ from phase_b_classification import (
 st.set_page_config(page_title="Phase B — Full Universe Discovery", layout="wide")
 st.title("Phase B — Full Universe Intraday Discovery")
 st.caption("All 34 hypotheses, all 11 themes. Discovery research using the Phase A-validated engine, unchanged. Not the live scanner.")
-st.caption("Runs in batches of 8 tickers (Phase A's proven scale) instead of all 39 at once. Run every batch below, in any order, then send all downloaded CSVs back together.")
+st.caption("Runs in batches of 8 tickers (Phase A's proven scale). Run every batch below, in any order, then send all downloaded CSVs back together.")
 
 by_id = {h["id"]: h for h in HYPOTHESES}
 INTRADAY_START = datetime(2020, 10, 12, tzinfo=timezone.utc)
@@ -86,9 +87,6 @@ def load_driver_table():
     return build_driver_table(list(DRIVERS.keys()), fetch_fn=cached_fetch_daily, drivers_lookup=DRIVERS)
 
 
-# max_entries=1: only the ticker currently being processed needs to stay
-# cached. Without this cap, Streamlit's cache keeps every ticker's raw
-# intraday history resident for the whole run on top of the working copy.
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False, max_entries=1)
 def load_intraday_for_ticker(ticker):
     eodhd_ticker = to_eodhd_ticker(ticker)
@@ -99,8 +97,6 @@ def load_intraday_for_ticker(ticker):
 
 
 def all_needed_tickers():
-    """Union of every ticker across EVERY theme referenced by any of
-    the 34 hypotheses — the full universe, not just Grade-A."""
     themes = {h["theme"] for h in HYPOTHESES}
     tickers = set()
     for t in themes:
@@ -119,8 +115,6 @@ def outcomes_for_dates(clean_days, date_strs, direction):
 
 
 def get_anchor_stats(agg):
-    """Pulls the pre-specified classification anchor (2%, full_session)
-    absolute probability out of an aggregated stats dict."""
     return agg["thresholds"].get(CLASSIFICATION_ANCHOR_THRESHOLD_PCT)
 
 
@@ -139,11 +133,12 @@ def build_theme_to_hypotheses():
     return m
 
 
-def run_batch(batch_tickers, batch_num, total_batches):
+def compute_batch(batch_tickers, batch_num, total_batches):
+    """Does the actual fetch + scoring work. Returns a dict of results
+    (or None if nothing usable was found) — never renders anything
+    itself, so it only runs when the Run button is freshly clicked."""
     with st.spinner("Pulling driver history..."):
         driver_table, driver_failures = load_driver_table()
-    if driver_failures:
-        st.warning(f"{len(driver_failures)} driver ticker(s) failed: {driver_failures}")
 
     ticker_to_themes = build_ticker_to_themes()
     theme_to_hypotheses = build_theme_to_hypotheses()
@@ -182,7 +177,7 @@ def run_batch(batch_tickers, batch_num, total_batches):
         relevant_themes = ticker_to_themes.get(ticker, set())
         relevant_hypotheses = [h for theme in relevant_themes for h in theme_to_hypotheses.get(theme, [])]
 
-        baseline_cache_for_ticker = {}  # direction -> aggregated baseline, reused across hypotheses sharing a direction
+        baseline_cache_for_ticker = {}
 
         for h in relevant_hypotheses:
             hid = h["id"]
@@ -272,21 +267,46 @@ def run_batch(batch_tickers, batch_num, total_batches):
 
     progress.empty()
 
-    if fail_summary:
-        st.warning(f"{len(fail_summary)} ticker(s) had at least one failed fetch window: {[t for t, _ in fail_summary]}")
-
     if not any_clean_days_found:
-        st.error("No clean intraday days found anywhere in this batch — nothing to show.")
-        return
+        return {
+            "summary_df": None, "full_detail_df": None,
+            "fail_summary": fail_summary, "driver_failures": driver_failures,
+            "batch_tickers": batch_tickers,
+        }
 
     summary_df = pd.DataFrame(all_summary_rows)
     grade_order = {"A": 0, "B": 1, "C": 2}
     summary_df["_sort"] = summary_df["grade"].map(grade_order)
     summary_df = summary_df.sort_values(["_sort", "stability_min_delta_pp"], ascending=[True, False]).drop(columns="_sort")
 
+    return {
+        "summary_df": summary_df,
+        "full_detail_df": pd.DataFrame(full_detail_rows),
+        "fail_summary": fail_summary,
+        "driver_failures": driver_failures,
+        "batch_tickers": batch_tickers,
+    }
+
+
+def render_batch_result(result, batch_num, total_batches):
+    """Pure display — reads from the dict already computed (and stashed
+    in session_state), never re-fetches or re-scores anything. Safe to
+    call on every rerun, including ones triggered by a download click."""
+    if result["driver_failures"]:
+        st.warning(f"{len(result['driver_failures'])} driver ticker(s) failed: {result['driver_failures']}")
+    if result["fail_summary"]:
+        st.warning(f"{len(result['fail_summary'])} ticker(s) had at least one failed fetch window: {[t for t, _ in result['fail_summary']]}")
+
+    summary_df = result["summary_df"]
+    full_detail_df = result["full_detail_df"]
+
+    if summary_df is None:
+        st.error("No clean intraday days found anywhere in this batch — nothing to show.")
+        return
+
     st.divider()
     st.subheader(f"Batch {batch_num}/{total_batches} — {len(summary_df)} (hypothesis, ticker) pairs")
-    st.caption(f"Tickers in this batch: {', '.join(batch_tickers)}")
+    st.caption(f"Tickers in this batch: {', '.join(result['batch_tickers'])}")
     st.caption(f"Grading anchor: +{CLASSIFICATION_ANCHOR_THRESHOLD_PCT:.0f}% threshold, {CLASSIFICATION_ANCHOR_CHECKPOINT}.")
 
     for grade in ["A", "B", "C"]:
@@ -308,7 +328,7 @@ def run_batch(batch_tickers, batch_num, total_batches):
                             file_name=f"phase_b_summary_batch{batch_num}.csv", mime="text/csv",
                             use_container_width=True, key=f"summary_dl_{batch_num}")
     with c2:
-        st.download_button(f"Batch {batch_num} full detail CSV", data=pd.DataFrame(full_detail_rows).to_csv(index=False),
+        st.download_button(f"Batch {batch_num} full detail CSV", data=full_detail_df.to_csv(index=False),
                             file_name=f"phase_b_full_detail_batch{batch_num}.csv", mime="text/csv",
                             use_container_width=True, key=f"detail_dl_{batch_num}")
 
@@ -319,9 +339,13 @@ batches = [all_tickers[i:i + BATCH_SIZE] for i in range(0, len(all_tickers), BAT
 
 st.divider()
 st.subheader(f"Run each batch below ({len(batches)} batches, {len(all_tickers)} tickers total)")
-st.caption("Order doesn't matter — each batch is independent. Run all of them, download every CSV, send them all back together.")
+st.caption("Order doesn't matter — each batch is independent. Run all of them, download every CSV, send them all back together. Once a batch finishes, both its downloads stay available — no need to re-run just to grab the second file.")
 
 for batch_num, batch_tickers in enumerate(batches, start=1):
+    state_key = f"batch_{batch_num}_result"
     with st.expander(f"Batch {batch_num} of {len(batches)} — {len(batch_tickers)} tickers: {', '.join(batch_tickers)}"):
         if st.button(f"Run Batch {batch_num}", type="primary", use_container_width=True, key=f"run_{batch_num}"):
-            run_batch(batch_tickers, batch_num, len(batches))
+            st.session_state[state_key] = compute_batch(batch_tickers, batch_num, len(batches))
+
+        if state_key in st.session_state:
+            render_batch_result(st.session_state[state_key], batch_num, len(batches))
