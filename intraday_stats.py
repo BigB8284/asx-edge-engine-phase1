@@ -3,8 +3,18 @@ INTRADAY STATS — aggregation, baseline comparison, plain-English summaries
 ================================================================================
 Takes the per-day outputs of intraday_engine.compute_day_outcomes and
 aggregates them into signal-day stats, baseline (unconditional) stats,
-and the comparison between the two. Every threshold (1/2/3/5%) is
-reported on equal footing — none is treated as the headline.
+and the comparison between the two. Every threshold (now 1/2/3/4% per
+the V3 spec, was 1/2/3/5%) is reported on equal footing — none is
+treated as the headline.
+
+V3 ADDITION (2026-08-14): compute_target_before_adverse(), below. This
+answers "how often does the target get reached before a given adverse
+move" — e.g. "+2% reached before -1%". It requires NO changes to
+intraday_engine.py's core loop: each day's `mae_before` field, captured
+at the exact moment a threshold is first reached, already reflects the
+engine's existing conservative same-bar convention (adverse extreme
+processed before favourable extreme within a bar). This function is a
+pure aggregation over that already-correct per-day data.
 """
 
 import math
@@ -40,7 +50,6 @@ def aggregate_outcomes(day_outcomes_list):
     n_days = len(days)
     result = {"n_days": n_days}
 
-    # --- Threshold-level: probability reached, CI, time-to-threshold, MAE-before ---
     threshold_stats = {}
     for t in THRESHOLDS:
         reached_flags = [d["thresholds"][t]["reached"] for d in days]
@@ -57,7 +66,6 @@ def aggregate_outcomes(day_outcomes_list):
         }
     result["thresholds"] = threshold_stats
 
-    # --- Threshold x checkpoint: probability reached BY each checkpoint ---
     checkpoint_stats = {}
     for cp in CHECKPOINTS:
         checkpoint_stats[cp] = {}
@@ -71,7 +79,6 @@ def aggregate_outcomes(day_outcomes_list):
                                         "ci_lo": round(ci_lo * 100, 1), "ci_hi": round(ci_hi * 100, 1)}
     result["checkpoints"] = checkpoint_stats
 
-    # --- MFE/MAE distributions per window ---
     window_stats = {}
     for w in MFE_MAE_WINDOWS:
         mfes = [d["windows"][w]["mfe"] for d in days if d["windows"][w]["mfe"] is not None]
@@ -84,6 +91,52 @@ def aggregate_outcomes(day_outcomes_list):
         }
     result["windows"] = window_stats
 
+    return result
+
+
+DEFAULT_ADVERSE_LEVELS_PCT = [-0.5, -1.0, -2.0]
+
+
+def compute_target_before_adverse(day_outcomes_list, adverse_levels_pct=None):
+    """For each threshold T, computes P(T reached AND the worst adverse
+    excursion before reaching it stayed better than A) for each adverse
+    level A in adverse_levels_pct. Denominator is ALL days (n_days),
+    matching how the existing threshold "probability" stat is computed
+    — this is "how often does this specific, better outcome happen",
+    not "of the days it worked, how clean was the path".
+
+    Relies entirely on the per-day `mae_before` field already computed
+    by intraday_engine.compute_day_outcomes under its existing
+    conservative same-bar convention. No new per-bar logic here.
+
+    day_outcomes_list: list of dicts from compute_day_outcomes (None
+    entries must already be filtered out, same convention as
+    aggregate_outcomes above).
+
+    Returns: {threshold: {adverse_level: {"probability": pct, "n_days": n,
+              "n_reached_before_adverse": count}}}
+    """
+    if adverse_levels_pct is None:
+        adverse_levels_pct = DEFAULT_ADVERSE_LEVELS_PCT
+
+    days = [d for d in day_outcomes_list if d is not None]
+    n_days = len(days)
+    result = {}
+
+    for t in THRESHOLDS:
+        result[t] = {}
+        for a in adverse_levels_pct:
+            n_reached_before_adverse = 0
+            for d in days:
+                th = d["thresholds"][t]
+                if th["reached"] and th["mae_before"] is not None and th["mae_before"] > a:
+                    n_reached_before_adverse += 1
+            prob = n_reached_before_adverse / n_days if n_days else 0
+            result[t][a] = {
+                "probability": round(prob * 100, 1),
+                "n_days": n_days,
+                "n_reached_before_adverse": n_reached_before_adverse,
+            }
     return result
 
 
@@ -112,7 +165,7 @@ def format_summary_line(ticker, direction, signal_agg, baseline_agg, delta):
     'PDN LONG — signal days: 38% reached +2% by 11:00 vs 17% normally; ...'
     """
     parts = [f"{ticker} {direction} — signal days:"]
-    for t in [2.0, 3.0]:  # the two most illustrative thresholds for the headline line; full detail carries all four
+    for t in [2.0, 3.0]:
         d = delta["checkpoints"]["11:00"][t]
         parts.append(f"{d['signal_probability']:.0f}% reached +{t:.0f}% by 11:00 vs {d['baseline_probability']:.0f}% normally;")
     mfe = signal_agg["windows"]["full_session"]["median_mfe"]
