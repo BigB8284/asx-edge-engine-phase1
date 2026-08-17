@@ -197,16 +197,33 @@ def process_ticker(ticker, driver_table, mem_log):
         train_agg = aggregate_outcomes(train_outcomes)
         ladder_rows, sweet_spot = build_ladder_and_select(train_agg, baseline_agg)
 
+        # BUGFIX (found via real pilot data, 2026-08-16): n_train/n_validation/n_test
+        # must be the ACTUAL count of days that produced a usable outcome (what the
+        # gate and confidence classifier really use), not the raw count of matched
+        # dates from the driver condition. Those two numbers can diverge when a
+        # matched date falls on a day with no usable intraday data — the classifier
+        # was already correctly using the real count, but the CSV was reporting a
+        # different, possibly larger number, making the displayed n inconsistent
+        # with the confidence label next to it. Both counts are now reported,
+        # clearly labeled, so any gap between them is visible rather than hidden.
+        n_train_matched_dates = len(train_d)
+        n_validation_matched_dates = len(val_d)
+        n_test_matched_dates = len(test_d)
+        n_train_actual = train_agg["n_days"]
+
         card = {
             "ticker": ticker, "hypothesis_id": h["id"], "theme": h["theme"], "direction": direction,
             "driver_sign_convention": h.get("driver_sign_convention"), "status": h.get("status"),
-            "n_train": len(train_d), "n_validation": len(val_d), "n_test": len(test_d),
+            "n_train": n_train_actual, "n_train_matched_dates": n_train_matched_dates,
+            "n_validation_matched_dates": n_validation_matched_dates, "n_test_matched_dates": n_test_matched_dates,
             "ladder": ladder_rows, "sweet_spot": sweet_spot,
         }
 
         if sweet_spot is None:
             card["confidence"] = "EXPERIMENTAL"
             card["confidence_note"] = "No combo cleared the eligibility gate on training data for this hypothesis/ticker."
+            card["n_validation"] = n_validation_matched_dates  # no locked combo evaluated, matched-dates is all we have
+            card["n_test"] = n_test_matched_dates
         else:
             t_locked, cp_locked = sweet_spot["threshold_pct"], sweet_spot["checkpoint"]
             val_result = evaluate_locked_combo(clean_days, direction, [str(d.date()) for d in val_d], t_locked, cp_locked, baseline_agg)
@@ -215,6 +232,13 @@ def process_ticker(ticker, driver_table, mem_log):
             card["locked_checkpoint"] = cp_locked
             card["validation_result"] = val_result
             card["test_result"] = test_result
+            # The REAL n used for classification — matches what classify_confidence sees.
+            card["n_validation"] = val_result["n"] if val_result else 0
+            card["n_test"] = test_result["n"] if test_result else 0
+            if card["n_validation"] != n_validation_matched_dates or card["n_test"] != n_test_matched_dates:
+                card["n_gap_note"] = (f"{n_validation_matched_dates - card['n_validation']} matched validation date(s) and "
+                                      f"{n_test_matched_dates - card['n_test']} matched test date(s) had no usable intraday "
+                                      f"outcome — real n is lower than the raw matched-date count.")
             card["confidence"] = v3c.classify_confidence(
                 val_result["delta_pp"] if val_result else None,
                 test_result["delta_pp"] if test_result else None,
@@ -266,6 +290,8 @@ def render_card(card, rank=None):
 
     st.markdown(f"**Confidence: {card['confidence']}**" + (f" — {card.get('confidence_note','')}" if card.get("confidence_note") else ""))
     st.caption(f"n train/validation/test: {card['n_train']}/{card['n_validation']}/{card['n_test']}")
+    if card.get("n_gap_note"):
+        st.caption(f"⚠️ {card['n_gap_note']}")
 
     # Full ladder — every combo, gated or not
     ladder_df = pd.DataFrame(card["ladder"])
@@ -333,7 +359,11 @@ def render_pilot_result(result, batch_num, total_batches):
             continue
         row = {"ticker": c["ticker"], "hypothesis_id": c["hypothesis_id"], "theme": c["theme"],
                "direction": c["direction"], "confidence": c["confidence"],
-               "n_train": c["n_train"], "n_validation": c["n_validation"], "n_test": c["n_test"]}
+               "n_train": c["n_train"], "n_validation": c["n_validation"], "n_test": c["n_test"],
+               "n_train_matched_dates": c.get("n_train_matched_dates"),
+               "n_validation_matched_dates": c.get("n_validation_matched_dates"),
+               "n_test_matched_dates": c.get("n_test_matched_dates"),
+               "n_gap_note": c.get("n_gap_note", "")}
         if c.get("sweet_spot"):
             row["sweet_spot_threshold"] = c["sweet_spot"]["threshold_pct"]
             row["sweet_spot_checkpoint"] = c["sweet_spot"]["checkpoint"]
