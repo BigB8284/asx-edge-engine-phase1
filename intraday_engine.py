@@ -14,14 +14,24 @@ a bar's high or low came first. Every function here uses a fixed,
 conservative convention — within each bar, the ADVERSE extreme is
 processed before the FAVOURABLE extreme — so MAE-before-threshold is
 never understated. This is a stated assumption, not a hidden one.
+
+V3 CHANGE (2026-08-14): THRESHOLDS changed from [1,2,3,5] to [1,2,3,4]
+per the approved V3 spec — morning-excursion categories are 1/2/3/4%+,
+not a separate 5%/6% target (magnitude beyond 4% is read off the
+existing MFE window data instead). CHECKPOINTS gains "11:30" (90 min
+from open), completing the approved 10:15/10:30/11:00/11:30/12:00 set.
+The conservative same-bar convention above is UNCHANGED and is what
+the new V3 target-before-adverse-move statistic (in intraday_stats.py)
+relies on — that stat needed zero changes to this file's core loop,
+since `mae_before` already captures exactly what it needs.
 """
 
 import pandas as pd
 import numpy as np
 import math
 
-THRESHOLDS = [1.0, 2.0, 3.0, 5.0]
-CHECKPOINTS = ["10:15", "10:30", "11:00", "12:00", "full_session"]
+THRESHOLDS = [1.0, 2.0, 3.0, 4.0]
+CHECKPOINTS = ["10:15", "10:30", "11:00", "11:30", "12:00", "full_session"]
 MFE_MAE_WINDOWS = [30, 60, 90, "full_session"]
 
 
@@ -45,11 +55,6 @@ def compute_day_outcomes(bars, direction):
     if bars.empty:
         return None
 
-    # Drop any bar with missing OHLC data (real EODHD bars occasionally have
-    # null prices, especially for thin/illiquid names like BOE.AX/DYL.AX in
-    # quiet minutes) — treated as if that bar didn't exist, not fabricated.
-    # If this shifts the effective "day open" to a later bar than the true
-    # session start, that's a known, documented fallback, not silent.
     bars = bars.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
     if bars.empty:
         return None
@@ -57,7 +62,6 @@ def compute_day_outcomes(bars, direction):
     open_price = bars.iloc[0]["open"]
     result = {"open_price": open_price, "n_bars": len(bars)}
 
-    # Favourable/adverse extreme per bar, direction-aware, computed once.
     if direction == "LONG":
         bars = bars.assign(
             favourable_extreme=lambda d: signed_pct(d["high"], open_price, direction),
@@ -69,15 +73,12 @@ def compute_day_outcomes(bars, direction):
             adverse_extreme=lambda d: signed_pct(d["high"], open_price, direction),
         )
 
-    # --- Threshold crossing: time-to-threshold, MAE-before-threshold ---
     running_mfe = -math.inf
     running_mae = math.inf
     threshold_results = {t: {"reached": False, "time_minutes": None, "mae_before": None} for t in THRESHOLDS}
 
     for _, bar in bars.iterrows():
-        # Conservative convention: process the ADVERSE extreme first.
         running_mae = min(running_mae, bar["adverse_extreme"])
-        # Then the favourable extreme, checking for new threshold crossings.
         for t in THRESHOLDS:
             if not threshold_results[t]["reached"] and bar["favourable_extreme"] >= t:
                 threshold_results[t]["reached"] = True
@@ -87,8 +88,7 @@ def compute_day_outcomes(bars, direction):
 
     result["thresholds"] = threshold_results
 
-    # --- reached_by_checkpoint: independent re-check restricted to bars up to each checkpoint ---
-    checkpoint_minutes = {"10:15": 15, "10:30": 30, "11:00": 60, "12:00": 120, "full_session": math.inf}
+    checkpoint_minutes = {"10:15": 15, "10:30": 30, "11:00": 60, "11:30": 90, "12:00": 120, "full_session": math.inf}
     reached_by_checkpoint = {}
     for cp_name, cp_minutes in checkpoint_minutes.items():
         sub = bars[bars["minutes_from_open"] <= cp_minutes]
@@ -98,7 +98,6 @@ def compute_day_outcomes(bars, direction):
         }
     result["reached_by_checkpoint"] = reached_by_checkpoint
 
-    # --- MFE/MAE per window, with time-to-MFE ---
     window_results = {}
     for w in MFE_MAE_WINDOWS:
         w_minutes = w if isinstance(w, (int, float)) else math.inf
@@ -109,9 +108,6 @@ def compute_day_outcomes(bars, direction):
         mfe = sub["favourable_extreme"].max()
         mae = sub["adverse_extreme"].min()
         if pd.isna(mfe) or pd.isna(mae):
-            # Defensive fallback: shouldn't happen after the top-level dropna,
-            # but if a window subset somehow ends up all-NaN, degrade to
-            # "no data for this window" rather than crash the whole day.
             window_results[w] = {"mfe": None, "mae": None, "time_to_mfe_minutes": None}
             continue
         mfe_row = sub[sub["favourable_extreme"] == mfe].iloc[0]
