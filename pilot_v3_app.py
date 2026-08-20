@@ -100,6 +100,62 @@ def outcomes_for_dates(clean_days, date_strs, direction):
     return outcomes
 
 
+def build_full_ungated_matrix(clean_days, direction, train_agg, baseline_agg, train_d, val_d, test_d):
+    """Per your instruction to stop hiding cells behind the confidence
+    gate: computes train/validation/test probability + delta for EVERY
+    scanner-eligible (threshold, checkpoint) cell, gated or not. Reuses
+    the same aggregate_outcomes() call already made for the sweet-spot
+    evaluation -- just extracts every cell from it instead of one. No
+    new statistics, no change to the frozen gate/score/selection logic
+    (that still runs separately, unaffected, in build_ladder_and_select).
+    """
+    val_outcomes = outcomes_for_dates(clean_days, [str(d.date()) for d in val_d], direction)
+    test_outcomes = outcomes_for_dates(clean_days, [str(d.date()) for d in test_d], direction)
+    val_agg = aggregate_outcomes(val_outcomes) if val_outcomes else None
+    test_agg = aggregate_outcomes(test_outcomes) if test_outcomes else None
+
+    rows = []
+    for t in THRESHOLDS:
+        mae_before = train_agg["thresholds"][t]["median_mae_before_reached"]
+        median_time = train_agg["thresholds"][t]["median_time_to_threshold_min"]
+        target_before_adverse = compute_target_before_adverse(
+            outcomes_for_dates(clean_days, [str(d.date()) for d in train_d], direction)
+        )[t]
+
+        for cp in SCANNER_CHECKPOINTS:
+            train_sig = train_agg["checkpoints"][cp][t]
+            base = baseline_agg["checkpoints"][cp][t]
+
+            row = {
+                "threshold_pct": t, "checkpoint": cp,
+                "baseline_probability": base["probability"],
+                "train_probability": train_sig["probability"], "train_n": train_sig["n_days"],
+                "train_delta_pp": round(train_sig["probability"] - base["probability"], 1),
+                "median_mae_before_reached": mae_before, "median_time_to_threshold_min": median_time,
+                # Opportunity score is now computed for EVERY cell, gated or not --
+                # informational (the "attractiveness" axis), never a filter on visibility.
+                "opportunity_score": v3c.score_opportunity(train_sig["probability"], t, cp),
+                "gate_passed_frozen_rule": v3c.passes_eligibility_gate(
+                    round(train_sig["probability"] - base["probability"], 1), train_sig["n_days"], mae_before, t),
+            }
+            for a, s in target_before_adverse.items():
+                row[f"target_before_adverse_{a}pct"] = s["probability"]
+
+            if val_agg is not None:
+                val_sig = val_agg["checkpoints"][cp][t]
+                row["validation_probability"] = val_sig["probability"]
+                row["validation_n"] = val_sig["n_days"]
+                row["validation_delta_pp"] = round(val_sig["probability"] - base["probability"], 1)
+            if test_agg is not None:
+                test_sig = test_agg["checkpoints"][cp][t]
+                row["test_probability"] = test_sig["probability"]
+                row["test_n"] = test_sig["n_days"]
+                row["test_delta_pp"] = round(test_sig["probability"] - base["probability"], 1)
+
+            rows.append(row)
+    return rows
+
+
 def build_ladder_and_select(train_agg, baseline_agg):
     """For every scanner-eligible (threshold, checkpoint) combo: pull
     train probability + baseline + delta, check the eligibility gate,
@@ -196,6 +252,7 @@ def process_ticker(ticker, driver_table, mem_log):
 
         train_agg = aggregate_outcomes(train_outcomes)
         ladder_rows, sweet_spot = build_ladder_and_select(train_agg, baseline_agg)
+        full_matrix = build_full_ungated_matrix(clean_days, direction, train_agg, baseline_agg, train_d, val_d, test_d)
 
         # BUGFIX (found via real pilot data, 2026-08-16): n_train/n_validation/n_test
         # must be the ACTUAL count of days that produced a usable outcome (what the
@@ -216,7 +273,7 @@ def process_ticker(ticker, driver_table, mem_log):
             "driver_sign_convention": h.get("driver_sign_convention"), "status": h.get("status"),
             "n_train": n_train_actual, "n_train_matched_dates": n_train_matched_dates,
             "n_validation_matched_dates": n_validation_matched_dates, "n_test_matched_dates": n_test_matched_dates,
-            "ladder": ladder_rows, "sweet_spot": sweet_spot,
+            "ladder": ladder_rows, "sweet_spot": sweet_spot, "full_matrix": full_matrix,
         }
 
         if sweet_spot is None:
@@ -354,6 +411,7 @@ def render_pilot_result(result, batch_num, total_batches):
     st.divider()
     st.subheader("Downloads")
     summary_rows = []
+    matrix_rows = []
     for c in cards:
         if "ladder" not in c:
             continue
@@ -376,10 +434,27 @@ def render_pilot_result(result, batch_num, total_batches):
             row["test_probability"] = c["test_result"]["probability"]
             row["test_delta_pp"] = c["test_result"]["delta_pp"]
         summary_rows.append(row)
+
+        # Full ungated matrix -- every cell, gated or not, per your instruction
+        # not to let the confidence gate determine what's even visible.
+        for m in c.get("full_matrix", []):
+            matrix_rows.append({"ticker": c["ticker"], "hypothesis_id": c["hypothesis_id"],
+                                 "theme": c["theme"], "direction": c["direction"],
+                                 "confidence_label_for_this_hypothesis": c["confidence"], **m})
+
     summary_df = pd.DataFrame(summary_rows)
-    st.download_button(f"Batch {batch_num} pilot report CSV", data=summary_df.to_csv(index=False),
-                        file_name=f"v3_pilot_report_batch{batch_num}.csv", mime="text/csv",
-                        key=f"pilot_dl_{batch_num}")
+    matrix_df = pd.DataFrame(matrix_rows)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(f"Batch {batch_num} sweet-spot summary CSV", data=summary_df.to_csv(index=False),
+                            file_name=f"v3_pilot_report_batch{batch_num}.csv", mime="text/csv",
+                            key=f"pilot_dl_{batch_num}")
+    with c2:
+        st.download_button(f"Batch {batch_num} FULL UNGATED MATRIX CSV", data=matrix_df.to_csv(index=False),
+                            file_name=f"v3_pilot_full_matrix_batch{batch_num}.csv", mime="text/csv",
+                            key=f"pilot_matrix_dl_{batch_num}")
+    st.caption("Full matrix = every threshold x checkpoint cell for every hypothesis, train/validation/test, "
+               "gated or not. The confidence label shown is for context only -- it does not filter which rows appear.")
 
 
 # ---- Batch layout ----
