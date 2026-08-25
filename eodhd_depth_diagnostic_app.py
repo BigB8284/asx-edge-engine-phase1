@@ -27,6 +27,24 @@ history is available."
 
 Failed fetch windows and per-ticker exclusions are shown explicitly,
 never silently dropped, per the project's standing rule.
+
+FIX 2026-08-25: the first real run of this tool 404'd on every single
+ticker, every window — because it was passing Yahoo-style tickers
+("CIA.AX") straight to EODHD, which uses its own suffix convention.
+pilot_v3_app.py has the real conversion:
+
+    def to_eodhd_ticker(yahoo_ticker):
+        if yahoo_ticker.endswith(".AX"):
+            return yahoo_ticker[:-3] + ".AU"
+        return yahoo_ticker
+
+Copied verbatim below rather than reimplemented. That file also
+revealed `INTRADAY_START = datetime(2020, 10, 12, ...)` as the date
+the live V3 pilot currently ASSUMES is the earliest usable intraday
+date — with no comment there confirming whether that was ever actually
+verified or just chosen as a reasonable cutoff. That assumption is
+exactly what this diagnostic's default start date (2015-01-01, well
+before 2020-10-12) is set up to check.
 """
 import time
 from datetime import datetime, date
@@ -36,6 +54,13 @@ import pandas as pd
 
 from intraday_data import fetch_full_intraday_history, build_clean_day_groups
 from eodhd_logic import to_sydney_and_classify
+
+
+def to_eodhd_ticker(yahoo_ticker):
+    # Verbatim from pilot_v3_app.py — do not reimplement differently.
+    if yahoo_ticker.endswith(".AX"):
+        return yahoo_ticker[:-3] + ".AU"
+    return yahoo_ticker
 
 # The 16 approved pilot tickers, from v3_pilot_config.PILOT_TICKERS.
 # Editable below in case the roster changes — this default is just what
@@ -89,6 +114,12 @@ st.warning(
     "that's a sign there may be more history before this point — widen the start date and rerun.",
     icon="⚠️",
 )
+st.info(
+    "pilot_v3_app.py currently assumes intraday data starts 2020-10-12 (INTRADAY_START), with no "
+    "comment confirming that was ever actually verified. The default start date below (2015-01-01) "
+    "is deliberately earlier than that, so this run can confirm or correct it.",
+    icon="ℹ️",
+)
 
 if st.button("Run EODHD depth diagnostic", type="primary"):
     if not api_token:
@@ -113,16 +144,18 @@ if st.button("Run EODHD depth diagnostic", type="primary"):
     all_flagged_moves = {}
 
     for i, ticker in enumerate(tickers):
-        status.write(f"Fetching {ticker}...  [{i + 1}/{len(tickers)}]")
+        eodhd_ticker = to_eodhd_ticker(ticker)
+        status.write(f"Fetching {ticker} (EODHD: {eodhd_ticker})...  [{i + 1}/{len(tickers)}]")
         progress.progress((i + 1) / len(tickers))
 
-        raw_bars, failed_windows = fetch_full_intraday_history(ticker, api_token, start_dt, end_dt)
+        raw_bars, failed_windows = fetch_full_intraday_history(eodhd_ticker, api_token, start_dt, end_dt)
         for w_start, w_end, reason in failed_windows:
-            all_failed_windows.append({"ticker": ticker, "window_start": w_start, "window_end": w_end, "reason": reason})
+            all_failed_windows.append({"ticker": ticker, "eodhd_ticker": eodhd_ticker,
+                                        "window_start": w_start, "window_end": w_end, "reason": reason})
 
         if not raw_bars:
             rows.append({
-                "ticker": ticker,
+                "ticker": ticker, "eodhd_ticker": eodhd_ticker,
                 "raw_earliest_bar": None, "raw_latest_bar": None,
                 "raw_unique_sessions": 0, "raw_total_bars": 0,
                 "clean_unique_sessions": 0, "clean_total_bars": 0,
@@ -137,7 +170,7 @@ if st.button("Run EODHD depth diagnostic", type="primary"):
         raw_df, err = to_sydney_and_classify(raw_bars)
         if err:
             rows.append({
-                "ticker": ticker,
+                "ticker": ticker, "eodhd_ticker": eodhd_ticker,
                 "raw_earliest_bar": None, "raw_latest_bar": None,
                 "raw_unique_sessions": 0, "raw_total_bars": len(raw_bars),
                 "clean_unique_sessions": 0, "clean_total_bars": 0,
@@ -154,7 +187,7 @@ if st.button("Run EODHD depth diagnostic", type="primary"):
         clean_date_sets[ticker] = set(clean_days.keys())
 
         rows.append({
-            "ticker": ticker,
+            "ticker": ticker, "eodhd_ticker": eodhd_ticker,
             "raw_earliest_bar": str(raw_df["sydney_dt"].min()),
             "raw_latest_bar": str(raw_df["sydney_dt"].max()),
             "raw_unique_sessions": raw_df["sydney_date"].nunique(),
