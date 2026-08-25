@@ -198,7 +198,14 @@ if st.button("Run EODHD depth diagnostic", type="primary"):
 
     if all_failed_windows:
         st.subheader("Failed fetch windows (shown, not silently dropped)")
-        st.dataframe(pd.DataFrame(all_failed_windows), width="stretch")
+        failed_df = pd.DataFrame(all_failed_windows)
+        st.dataframe(failed_df, width="stretch")
+        st.download_button(
+            "Download failed-windows CSV",
+            failed_df.to_csv(index=False).encode("utf-8"),
+            file_name="eodhd_depth_diagnostic_failed_windows.csv",
+            mime="text/csv",
+        )
 
     with st.expander("Per-ticker excluded (incomplete) days and flagged implausible-move days"):
         for t in tickers:
