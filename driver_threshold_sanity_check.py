@@ -33,6 +33,22 @@ wrote it (no network access to Yahoo Finance from that sandbox) — it
 has only been exercised against synthetic data to confirm it runs
 end-to-end without error. Run it for real in the GitHub/Streamlit
 environment and send the resulting CSV back.
+
+CHANGELOG — 2026-08-25, after the first real run
+(driver_threshold_sanity_check_results.csv, 88 conditions):
+  - natgas: DROPPED ENTIRELY. Not a driver relevant to Brent's ASX
+    trading universe — not searched, not optimised, not included.
+  - dxy +-3%: DROPPED. Zero occurrences either direction across the
+    full ~35-year aligned window (0/0) — a real result, not a
+    judgement call.
+  - Six conditions/sides dropped for TRAIN n<30 (the n>=30 rule was
+    NOT lowered to accommodate them): audusd +-2%, audusd +-3%,
+    dxy +-2%, xlc +-3%, xlp +-3%, xlre +-3%.
+  - vix: the flat +-1/2/3% band is REPLACED with +-5/10/15%. Real data
+    showed +-1% VIX fired on 38.8%/45.3% of all days (up/down), and
+    even +-3% still fired on 26.3%/30.1% — not a selective filter.
+    Awaiting a fresh occurrence-count rerun (VIX only, see
+    vix_threshold_rerun.py) before treating the new band as final.
 """
 import sys
 import pandas as pd
@@ -70,18 +86,46 @@ PART_A_THRESHOLDS = {
 # PART B — remaining PRIMARY drivers with no existing V1 threshold.
 # FALLBACK drivers (vale_adr, cliffs) are excluded per Brent's approval
 # — config_v1.py marks them confirmation-only, not standalone.
+# natgas removed 2026-08-25 (see changelog) — not relevant to Brent's
+# ASX trading universe.
 # ---------------------------------------------------------------------------
 PART_B_DRIVERS = [
     "dow", "russell2000", "vix", "xlf", "xlv", "xly", "xlp", "xli", "xlk",
-    "xlre", "xlu", "xlc", "wti", "natgas", "silver", "copper", "albemarle",
+    "xlre", "xlu", "xlc", "wti", "silver", "copper", "albemarle",
     "sqm", "ura", "cameco", "uec", "coal", "audusd", "dxy", "rio_adr", "newmont",
 ]
-PART_B_THRESHOLDS = [1.0, 2.0, 3.0]
+PART_B_THRESHOLDS_DEFAULT = [1.0, 2.0, 3.0]
+
+# Per-driver overrides to the default +-1/2/3% band. vix added
+# 2026-08-25 (see changelog) — the default band occurred on 26-45% of
+# all days in the real run, not a selective filter. These specific
+# values are pending a fresh occurrence-count rerun before being
+# treated as final (vix_threshold_rerun.py).
+PART_B_THRESHOLDS_OVERRIDE = {
+    "vix": [5.0, 10.0, 15.0],
+}
+
+# Specific (driver, threshold) conditions dropped after the real
+# 2026-08-25 run — either zero/near-zero occurrence, or TRAIN n<30 on
+# at least one side, per Brent's explicit review of that run's numbers.
+# The n>=30 rule itself was NOT lowered to accommodate these; the
+# conditions were dropped instead. See changelog above for the exact
+# real counts that drove each of these.
+EXCLUDED_CONDITIONS = {
+    ("dxy", 3.0),
+    ("dxy", 2.0),
+    ("audusd", 2.0),
+    ("audusd", 3.0),
+    ("xlc", 3.0),
+    ("xlp", 3.0),
+    ("xlre", 3.0),
+}
 
 # Drivers flagged as likely too volatile for a flat +-1/2/3% band to be
-# selective (known day-to-day behaviour, not yet confirmed against real
-# counts here) — surfaced in the output, not silently adjusted.
-FLAGGED_VOLATILE_DRIVERS = {"vix", "natgas"}
+# selective. natgas confirmed and dropped entirely (see changelog); vix
+# confirmed too loose at +-1/2/3% and widened to +-5/10/15% — kept
+# flagged here until the widened band is itself confirmed selective.
+FLAGGED_VOLATILE_DRIVERS = {"vix"}
 
 MIN_TRAIN_N = 30
 
@@ -92,8 +136,10 @@ def build_all_conditions():
         for th in thresholds:
             conditions.append((name, th, "existing"))
     for name in PART_B_DRIVERS:
-        for th in PART_B_THRESHOLDS:
+        thresholds = PART_B_THRESHOLDS_OVERRIDE.get(name, PART_B_THRESHOLDS_DEFAULT)
+        for th in thresholds:
             conditions.append((name, th, "new"))
+    conditions = [c for c in conditions if (c[0], c[1]) not in EXCLUDED_CONDITIONS]
     return conditions
 
 
