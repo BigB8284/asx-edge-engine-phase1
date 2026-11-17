@@ -142,7 +142,7 @@ class GitHubReleaseStore:
         """Confirms the token works and the repo is PRIVATE. Called once."""
         if self._checked:
             return
-        r = self._req("GET", f"{self.API}/repos/{self.repo}", expect=(200,))
+        r = self._req("GET", f"{self.API}/repos/{self.repo}", expect=(200,), headers=self._h())
         if r.status_code == 404:
             raise StoreError(f"Data repo '{self.repo}' not found, or the token can't see it.")
         if r.status_code in (401, 403):
